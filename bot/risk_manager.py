@@ -163,7 +163,7 @@ class RiskManager:
         """
         # API 실패 시 기존 포지션 매도는 허용 (안전 처분)
         if self.state.api_failed:
-            logger.warning("API 오류 상태이지만 안전 매도는 허용합니다.")
+            logger.info("API 오류 상태이지만 안전 매도는 허용합니다.")
 
         if signal != "SELL":
             return False, "매도 신호가 아닙니다"
@@ -269,6 +269,36 @@ class RiskManager:
                 f"{self.min_net_profit_pct:.3f}%"
             )
         return True, "순이익 기준 충족"
+
+    def check_take_profit_net(self, market: str, current_price: float,
+                              estimated_cost_pct: float = 0.0
+                              ) -> tuple[bool, str]:
+        """
+        순이익 기준 고정 익절 조건을 확인합니다.
+
+        Args:
+            market: 마켓 코드
+            current_price: 현재가
+            estimated_cost_pct: 왕복 비용 추정치(%, 수수료+슬리피지 등)
+
+        Returns:
+            tuple: (익절 도달 여부, 사유)
+        """
+        if self.take_profit_pct <= 0:
+            return False, ""
+
+        entry_price = self.state.entry_prices.get(market, 0)
+        if entry_price <= 0:
+            return False, "진입가 기록 없음"
+
+        gross_pct = (current_price - entry_price) / entry_price * 100
+        net_pct = gross_pct - estimated_cost_pct
+        target_pct = self.take_profit_pct * 100
+        if net_pct >= target_pct:
+            return True, (
+                f"익절 도달: 순이익 {net_pct:.2f}% >= 목표 {target_pct:.2f}%"
+            )
+        return False, ""
 
     # ============================================================
     # 상태 업데이트

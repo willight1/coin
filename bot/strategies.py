@@ -14,6 +14,7 @@ AI가 실시간으로 판단하는 구조는 사용하지 않습니다.
 4. 볼린저밴드 Mean Reversion 전략
 5. 돌파 + 거래량 증가 전략
 6. 레짐 적응형 전략 (상승=돌파, 횡보=평균회귀, 하락=진입 회피)
+7. 일봉 생존형 추세·눌림 전략
 
 사용법:
     strategy = RSIStrategy(oversold=30, overbought=70)
@@ -603,6 +604,222 @@ class RegimeAdaptiveStrategy(BaseStrategy):
 
 
 # ============================================================
+# 전략 7: 일봉 생존형 추세·눌림 전략
+# ============================================================
+class DailySurvivalTrendStrategy(BaseStrategy):
+    """
+    장기 추세(EMA200) 위에서만 매수하고, 횡보/저변동 구간은 회피합니다.
+    진입은 눌림 회복(EMA20 재돌파) + RSI 필터 또는 돌파+거래량 증가로 수행합니다.
+
+    의도:
+    - 추세장에서 수익 구간을 길게 가져가기
+    - 횡보장/저변동 구간의 불필요한 진입 줄이기
+    - 단순한 규칙으로 일봉 운용 가능하도록 구성
+    """
+
+    def __init__(
+        self,
+        trend_ema_period: int = 120,
+        signal_ema_period: int = 9,
+        exit_ema_period: int = 21,
+        breakout_period: int = 8,
+        vol_period: int = 10,
+        vol_mult: float = 1.0,
+        rsi_period: int = 14,
+        rsi_buy_min: float = 35.0,
+        rsi_buy_max: float = 70.0,
+        rsi_sell: float = 66.0,
+        atr_period: int = 14,
+        min_atr_pct: float = 0.001,
+        sell_confirm_bars: int = 1,
+    ):
+        self.trend_ema_period = trend_ema_period
+        self.signal_ema_period = signal_ema_period
+        self.exit_ema_period = exit_ema_period
+        self.breakout_period = breakout_period
+        self.vol_period = vol_period
+        self.vol_mult = vol_mult
+        self.rsi_period = rsi_period
+        self.rsi_buy_min = rsi_buy_min
+        self.rsi_buy_max = rsi_buy_max
+        self.rsi_sell = rsi_sell
+        self.atr_period = atr_period
+        self.min_atr_pct = min_atr_pct
+        self.sell_confirm_bars = max(1, sell_confirm_bars)
+
+    @property
+    def name(self) -> str:
+        return "1분 생존형 추세·눌림"
+
+    @property
+    def description(self) -> str:
+        return (
+            f"EMA({self.trend_ema_period}) 추세 필터 + EMA({self.signal_ema_period}) "
+            f"눌림 회복/돌파 진입. ATR%<{self.min_atr_pct * 100:.2f} 구간 회피, "
+            f"EMA({self.exit_ema_period}) {self.sell_confirm_bars}봉 하회 또는 "
+            f"RSI>{self.rsi_sell} 과열 후 약화 시 매도"
+        )
+
+    def generate_signal(self, df: pd.DataFrame) -> str:
+        min_len = max(
+            self.trend_ema_period + 2,
+            self.signal_ema_period + 2,
+            self.exit_ema_period + self.sell_confirm_bars + 1,
+            self.breakout_period + 2,
+            self.vol_period + 1,
+            self.rsi_period + 2,
+            self.atr_period + 2,
+        )
+        if len(df) < min_len:
+            return HOLD
+
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        volume = df["volume"]
+
+        ema_trend = calc_ema(close, self.trend_ema_period)
+        ema_signal = calc_ema(close, self.signal_ema_period)
+        ema_exit = calc_ema(close, self.exit_ema_period)
+        rsi = calc_rsi(close, self.rsi_period)
+        atr = calc_atr(high, low, close, self.atr_period)
+        atr_pct = atr / close
+        breakout = is_high_breakout(close, high, self.breakout_period)
+        vol_sma = calc_volume_sma(volume, self.vol_period)
+
+        curr_close = close.iloc[-1]
+        prev_close = close.iloc[-2]
+        curr_trend = ema_trend.iloc[-1]
+        prev_trend = ema_trend.iloc[-2]
+        curr_signal = ema_signal.iloc[-1]
+        prev_signal = ema_signal.iloc[-2]
+        curr_rsi = rsi.iloc[-1]
+        curr_atr_pct = atr_pct.iloc[-1]
+        curr_breakout = breakout.iloc[-1]
+        curr_volume = volume.iloc[-1]
+        curr_vol_sma = vol_sma.iloc[-1]
+
+        required = [
+            curr_trend, prev_trend, curr_signal, prev_signal,
+            curr_rsi, curr_atr_pct, curr_vol_sma,
+        ]
+        if any(pd.isna(v) for v in required):
+            return HOLD
+
+        uptrend = (
+            curr_close > (curr_trend * 0.997)
+            and curr_trend >= (prev_trend * 0.9995)
+        )
+        low_vol_range = curr_atr_pct < self.min_atr_pct
+        if low_vol_range:
+            return HOLD
+
+        # 매도: 추세 약화 또는 과열 후 하락 전환
+        if len(df) >= self.sell_confirm_bars:
+            below_exit = close < ema_exit
+            if bool(below_exit.tail(self.sell_confirm_bars).all()) and curr_rsi < 48:
+                return SELL
+        if curr_rsi > self.rsi_sell and curr_close < curr_signal:
+            return SELL
+        # 매도 보강: 단기 추세선 하향 이탈 + 모멘텀 약화
+        if curr_close < curr_signal and curr_rsi < 50:
+            return SELL
+
+        if not uptrend:
+            return HOLD
+
+        # 매수 1) 눌림 후 EMA20 회복 + RSI 건전 구간
+        pullback_reclaim = (
+            (prev_close <= prev_signal) and
+            (curr_close > curr_signal) and
+            (self.rsi_buy_min <= curr_rsi <= self.rsi_buy_max)
+        )
+        # 매수 1-보강) 상승 추세 내 단기 과매도 눌림
+        bull_dip_buy = (
+            curr_close < (curr_signal * 0.997)
+            and curr_close > (curr_trend * 0.992)
+            and 32.0 <= curr_rsi <= 58.0
+        )
+        # 매수 2) 고점 돌파 + 거래량 동반
+        breakout_entry = curr_breakout and (
+            (curr_volume > curr_vol_sma * self.vol_mult) or (curr_rsi >= 50.0)
+        )
+        # 1분봉 특화: 신호선 상향 재돌파 + RSI 중립 이상
+        micro_reclaim = (
+            (prev_close <= prev_signal)
+            and (curr_close > curr_signal)
+            and (curr_rsi >= 48.0)
+        )
+
+        if pullback_reclaim or bull_dip_buy or breakout_entry or micro_reclaim:
+            return BUY
+        return HOLD
+
+    def generate_signals_series(self, df: pd.DataFrame) -> pd.Series:
+        """벡터화된 신호 생성"""
+        signals = pd.Series(HOLD, index=df.index)
+
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        volume = df["volume"]
+
+        ema_trend = calc_ema(close, self.trend_ema_period)
+        ema_signal = calc_ema(close, self.signal_ema_period)
+        ema_exit = calc_ema(close, self.exit_ema_period)
+        rsi = calc_rsi(close, self.rsi_period)
+        atr = calc_atr(high, low, close, self.atr_period)
+        atr_pct = atr / close
+        breakout = is_high_breakout(close, high, self.breakout_period)
+        vol_sma = calc_volume_sma(volume, self.vol_period)
+
+        uptrend = (
+            (close > (ema_trend * 0.997)) &
+            (ema_trend >= (ema_trend.shift(1) * 0.9995))
+        )
+        low_vol_range = atr_pct < self.min_atr_pct
+
+        pullback_reclaim = (
+            (close.shift(1) <= ema_signal.shift(1)) &
+            (close > ema_signal) &
+            (rsi >= self.rsi_buy_min) &
+            (rsi <= self.rsi_buy_max)
+        )
+        bull_dip_buy = (
+            (close < (ema_signal * 0.997)) &
+            (close > (ema_trend * 0.992)) &
+            (rsi >= 32.0) &
+            (rsi <= 58.0)
+        )
+        breakout_entry = breakout & (
+            (volume > vol_sma * self.vol_mult) | (rsi >= 50.0)
+        )
+        micro_reclaim = (
+            (close.shift(1) <= ema_signal.shift(1)) &
+            (close > ema_signal) &
+            (rsi >= 48.0)
+        )
+        buy_cond = uptrend & ~low_vol_range & (
+            pullback_reclaim | bull_dip_buy | breakout_entry | micro_reclaim
+        )
+
+        below_exit = close < ema_exit
+        exit_trend = (
+            below_exit.rolling(window=self.sell_confirm_bars,
+                               min_periods=self.sell_confirm_bars)
+            .sum() == self.sell_confirm_bars
+        ) & (rsi < 48.0)
+        exit_overheat = (rsi > self.rsi_sell) & (close < ema_signal)
+        exit_momentum_weak = (close < ema_signal) & (rsi < 50.0)
+        sell_cond = exit_trend | exit_overheat | exit_momentum_weak
+
+        signals[sell_cond] = SELL
+        signals[buy_cond] = BUY
+        signals[buy_cond & sell_cond] = HOLD
+        return signals
+
+
+# ============================================================
 # 전략 레지스트리 — 사용 가능한 전략 목록
 # ============================================================
 def get_all_strategies() -> list[BaseStrategy]:
@@ -613,6 +830,7 @@ def get_all_strategies() -> list[BaseStrategy]:
         list[BaseStrategy]: 전략 리스트
     """
     return [
+        DailySurvivalTrendStrategy(),
         RegimeAdaptiveStrategy(
             trend_period=50,
             breakout_period=16,

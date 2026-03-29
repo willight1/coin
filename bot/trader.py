@@ -4,8 +4,8 @@ trader.py — 실거래 엔진
 검증을 통과한 전략 1개를 실행하여 자동 매매합니다.
 
 핵심 원칙:
-- 실거래 엔진은 절대 AI 응답을 직접 주문 판단에 사용하지 않습니다.
-- 오직 전략 함수가 반환한 BUY / SELL / HOLD 만 사용합니다.
+- 기본 주문 판단은 전략 함수가 반환한 BUY / SELL / HOLD 를 사용합니다.
+- 선택적으로 BUY에 한해 LLM 게이트를 보조 필터로 사용할 수 있습니다.
 - DRY_RUN / LIVE 모드를 분리합니다.
 - KeyboardInterrupt로 안전 종료합니다.
 - 예외 발생 시 안전 대기 후 재시도합니다.
@@ -15,6 +15,7 @@ trader.py — 실거래 엔진
     trader.run()  # 무한 루프 (Ctrl+C로 종료)
 """
 
+import os
 import time
 import traceback
 from datetime import datetime
@@ -27,8 +28,10 @@ from .upbit_client import UpbitClient, UpbitClientError
 from .risk_manager import RiskManager
 from .strategies import BaseStrategy, BUY, SELL, HOLD
 from .indicators import calc_atr
+from .llm_gate import LLMGate
 
 logger = get_logger(__name__)
+MIN_ORDER_KRW = 5000.0
 
 
 class Trader:
@@ -65,7 +68,13 @@ class Trader:
         self.max_chase_pct = max_chase_pct or RISK_CFG.max_chase_pct
         self.last_signal_order_candle = ""
         self.last_snapshot_candle = ""
+        self.last_notified_signal = ""
+        self.log_signal_change_only = (
+            os.getenv("BOT_LOG_SIGNAL_CHANGE_ONLY", "true").strip().lower()
+            in ("1", "true", "yes", "y")
+        )
         self.state_synced = False
+        self.llm_gate = LLMGate()
         self.estimated_roundtrip_cost_pct = (
             (BT_CFG.fee_rate + BT_CFG.slippage_rate) * 2 * 100
         )
@@ -78,6 +87,8 @@ class Trader:
         logger.info(f"  DRY_RUN: {self.client.dry_run}")
         logger.info(f"  추격매수 제한: {self.max_chase_pct * 100:.2f}%")
         logger.info(f"  최소 순이익 매도 기준: {RISK_CFG.min_net_profit_pct:.3f}%")
+        logger.info(f"  LLM 게이트 사용: {self.llm_gate.enabled}")
+        logger.info(f"  신호변경 로그 모드: {self.log_signal_change_only}")
 
     def run(self) -> None:
         """
@@ -115,7 +126,8 @@ class Trader:
                     time.sleep(30)
 
                 # 다음 주기까지 대기
-                logger.info(f"다음 조회까지 {self.interval}초 대기...")
+                if not self.log_signal_change_only:
+                    logger.info(f"다음 조회까지 {self.interval}초 대기...")
                 time.sleep(self.interval)
 
         except KeyboardInterrupt:
@@ -174,9 +186,9 @@ class Trader:
             )
             self.state_synced = True
         except UpbitClientError as e:
-            logger.warning(f"[동기화] 기존 보유 반영 실패(재시도 예정): {e}")
+            logger.info(f"[동기화] 기존 보유 반영 실패(재시도 예정): {e}")
         except Exception as e:
-            logger.warning(f"[동기화] 기존 보유 반영 예외(재시도 예정): {e}")
+            logger.info(f"[동기화] 기존 보유 반영 예외(재시도 예정): {e}")
 
     def _tick(self) -> None:
         """
@@ -189,7 +201,8 @@ class Trader:
         5. 주문 실행
         """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"[{now}] 트레이딩 사이클 시작")
+        if not self.log_signal_change_only:
+            logger.info(f"[{now}] 트레이딩 사이클 시작")
 
         # ---- 1. 캔들 데이터 조회 ----
         candles = self.client.get_candles_minutes(
@@ -199,7 +212,7 @@ class Trader:
         )
 
         if not candles:
-            logger.warning("캔들 데이터가 비어 있습니다.")
+            logger.info("캔들 데이터가 비어 있습니다.")
             return
 
         # 업비트 API는 최신 순으로 반환 → 시간 오름차순으로 정렬
@@ -222,10 +235,11 @@ class Trader:
                 return
 
         current_price = df["close"].iloc[-1]
-        logger.info(f"  현재가: {current_price:,.0f} KRW")
+        if not self.log_signal_change_only:
+            logger.info(f"  현재가: {current_price:,.0f} KRW")
 
         if len(df) < 2:
-            logger.warning("신호 계산에 필요한 캔들이 부족합니다.")
+            logger.info("신호 계산에 필요한 캔들이 부족합니다.")
             return
 
         # 진행 중인 현재 봉은 제외하고 직전 확정봉 기준으로 신호를 계산합니다.
@@ -237,7 +251,15 @@ class Trader:
             if "candle_date_time_kst" in signal_df.columns
             else signal_df.index[-1]
         )
-        logger.info(f"  전략 신호: {signal} (확정봉: {signal_candle})")
+        if signal != self.last_notified_signal:
+            prev = self.last_notified_signal or "NONE"
+            logger.info(
+                f"  전략 신호 변경: {prev} -> {signal} "
+                f"(확정봉: {signal_candle}, 현재가: {current_price:,.0f} KRW)"
+            )
+            self.last_notified_signal = signal
+        elif not self.log_signal_change_only:
+            logger.info(f"  전략 신호: {signal} (확정봉: {signal_candle})")
 
         # 분 단위 계좌 스냅샷 (수익률 분석용)
         if signal_candle != self.last_snapshot_candle:
@@ -251,6 +273,16 @@ class Trader:
             if stop:
                 logger.warning(f"  {stop_reason}")
                 self._execute_sell(current_price, reason="STOP_LOSS")
+                return
+
+            take_profit, take_profit_reason = self.risk_manager.check_take_profit_net(
+                self.market,
+                current_price,
+                estimated_cost_pct=self.estimated_roundtrip_cost_pct,
+            )
+            if take_profit:
+                logger.info(f"  {take_profit_reason}")
+                self._execute_sell(current_price, reason="TAKE_PROFIT")
                 return
 
             # 추세선(전략) 이탈은 트레일링 스탑보다 우선
@@ -332,6 +364,37 @@ class Trader:
 
                 buy_amount = self.risk_manager.get_buy_amount(krw_balance)
                 if buy_amount > 0:
+                    if buy_amount < MIN_ORDER_KRW:
+                        logger.info(
+                            "  매수 차단: 최소주문금액 미만 "
+                            f"({buy_amount:,.0f} KRW < {MIN_ORDER_KRW:,.0f} KRW)"
+                        )
+                        return
+
+                    gate = self.llm_gate.evaluate_buy(
+                        market=self.market,
+                        strategy_name=self.strategy.name,
+                        signal_candle=signal_candle,
+                        current_price=float(current_price),
+                        signal_price=float(signal_price),
+                        df=signal_df,
+                    )
+                    if not gate.allow:
+                        logger.info(
+                            "  매수 차단: LLM 게이트 "
+                            f"({gate.source}, conf={gate.confidence:.2f}) {gate.reason}"
+                        )
+                        return
+
+                    if gate.size_multiplier < 1.0:
+                        adjusted = buy_amount * gate.size_multiplier
+                        logger.info(
+                            "  매수 금액 조정: LLM 게이트 "
+                            f"{buy_amount:,.0f} -> {adjusted:,.0f} KRW "
+                            f"(x{gate.size_multiplier:.2f}, conf={gate.confidence:.2f})"
+                        )
+                        buy_amount = adjusted
+
                     if self._execute_buy(buy_amount, current_price):
                         self.last_signal_order_candle = signal_candle
                 else:
@@ -366,7 +429,8 @@ class Trader:
                 logger.info(f"  매도 차단: {reason}")
 
         else:
-            logger.info("  신호: HOLD — 대기")
+            if not self.log_signal_change_only:
+                logger.info("  신호: HOLD — 대기")
 
     def _execute_buy(self, amount: float, current_price: float) -> bool:
         """
@@ -404,7 +468,7 @@ class Trader:
             volume = self.client.get_balance(self.currency)
 
             if volume <= 0:
-                logger.warning("  >> 매도할 수량이 없습니다.")
+                logger.info("  >> 매도할 수량이 없습니다.")
                 self.risk_manager.record_sell(self.market)
                 return False
 
@@ -447,6 +511,6 @@ class Trader:
                 f"coin_value={coin_value:.2f} price={current_price:.2f}"
             )
         except UpbitClientError as e:
-            logger.warning(f"[계좌] {label} 스냅샷 실패: {e}")
+            logger.info(f"[계좌] {label} 스냅샷 실패: {e}")
         except Exception as e:
-            logger.warning(f"[계좌] {label} 스냅샷 예외: {e}")
+            logger.info(f"[계좌] {label} 스냅샷 예외: {e}")

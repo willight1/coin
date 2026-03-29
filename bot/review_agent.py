@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+
+import requests
 
 from .logger import get_logger
 from .paths import PROJECT_ROOT
@@ -59,6 +62,9 @@ class ReviewAgent:
 
     def __init__(self, base_dir: str = ""):
         self.base_dir = base_dir or PROJECT_ROOT
+        self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+        self.openai_timeout = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
 
     def _resolve_log_path(self, date_str: str = "") -> str:
         if not date_str:
@@ -158,6 +164,94 @@ class ReviewAgent:
             )
         return suggestions
 
+    def _build_ai_suggestions(self, summary: ReviewSummary) -> list[str]:
+        """
+        OpenAI GPT API를 사용해 전략 보완 제안을 생성합니다.
+        API 키가 없거나 호출 실패 시 빈 리스트를 반환합니다.
+        """
+        if not self.openai_api_key:
+            return []
+
+        ret = summary.daily_return_pct
+        ret_str = "N/A" if ret is None else f"{ret:.4f}%"
+        payload_data = {
+            "signals": {
+                "BUY": summary.signals.get("BUY", 0),
+                "SELL": summary.signals.get("SELL", 0),
+                "HOLD": summary.signals.get("HOLD", 0),
+            },
+            "orders": {
+                "buy_attempts": summary.buy_attempts,
+                "buy_success": summary.buy_success,
+                "buy_failures": summary.buy_failures,
+                "sell_attempts": summary.sell_attempts,
+                "sell_success": summary.sell_success,
+                "sell_failures": summary.sell_failures,
+            },
+            "errors": summary.errors,
+            "warnings": summary.warnings,
+            "daily_return_pct": ret_str,
+            "top_buy_blocks": summary.buy_blocks.most_common(5),
+            "top_sell_blocks": summary.sell_blocks.most_common(5),
+        }
+        prompt = (
+            "다음 트레이딩 리뷰 통계를 바탕으로, 실행 가능한 개선안 5개를 한국어 bullet로 작성하세요. "
+            "모호한 표현을 피하고 수치 파라미터 조정안을 포함하세요.\n\n"
+            f"{json.dumps(payload_data, ensure_ascii=False)}"
+        )
+
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.openai_model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "당신은 규칙 기반 자동매매 시스템 리뷰어다. "
+                                "보수적이고 실행 가능한 개선안을 제시한다."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                },
+                timeout=self.openai_timeout,
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    f"AI 제안 생성 실패: HTTP {response.status_code} {response.text}"
+                )
+                return []
+
+            data = response.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not content:
+                return []
+
+            items: list[str] = []
+            for raw in content.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                line = re.sub(r"^[-*•\d\.\)\s]+", "", line).strip()
+                if line:
+                    items.append(line)
+            return items[:7]
+        except Exception as e:
+            logger.warning(f"AI 제안 생성 예외: {e}")
+            return []
+
     def build_report(self, summary: ReviewSummary) -> str:
         ret = summary.daily_return_pct
         ret_str = f"{ret:.2f}%" if ret is not None else "산출 불가 (START/END 스냅샷 필요)"
@@ -197,9 +291,20 @@ class ReviewAgent:
             for reason, count in summary.sell_blocks.most_common(5):
                 lines.append(f"- {reason}: {count}회")
 
+        base_suggestions = self.suggest(summary)
+        ai_suggestions = self._build_ai_suggestions(summary)
+        final_suggestions = ai_suggestions if ai_suggestions else base_suggestions
+
         lines.append("")
-        lines.append("## 전략 보완 제안")
-        for suggestion in self.suggest(summary):
+        if ai_suggestions:
+            lines.append("## 전략 보완 제안 (GPT)")
+            lines.append(
+                f"- AI 모델: `{self.openai_model}` "
+                "(API 호출 실패 시 규칙 기반 제안으로 자동 전환)"
+            )
+        else:
+            lines.append("## 전략 보완 제안")
+        for suggestion in final_suggestions:
             lines.append(f"- {suggestion}")
 
         return "\n".join(lines) + "\n"
