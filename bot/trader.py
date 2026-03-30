@@ -70,6 +70,8 @@ class Trader:
         self.last_signal_order_candle = ""
         self.last_snapshot_candle = ""
         self.last_notified_signal = ""
+        self.last_llm_signal = ""
+        self.cached_signal_gate = None
         self.log_signal_change_only = (
             os.getenv("BOT_LOG_SIGNAL_CHANGE_ONLY", "true").strip().lower()
             in ("1", "true", "yes", "y")
@@ -273,6 +275,34 @@ class Trader:
         elif not self.log_signal_change_only:
             logger.info(f"  전략 신호: {signal} (확정봉: {signal_candle})")
 
+        signal_changed = signal != self.last_llm_signal
+        if signal_changed:
+            self.last_llm_signal = signal
+            self.cached_signal_gate = self.llm_gate.evaluate_signal(
+                signal=signal,
+                market=self.market,
+                strategy_name=self.strategy.name,
+                signal_candle=signal_candle,
+                current_price=float(current_price),
+                signal_price=float(signal_price),
+                df=signal_df,
+                has_position=self.risk_manager.state.current_positions > 0,
+            )
+            gate = self.cached_signal_gate
+            logger.info(
+                "  AI 신호 분석: "
+                f"{signal} -> {'ALLOW' if gate.allow else 'BLOCK'} "
+                f"(source={gate.source}, conf={gate.confidence:.2f}, "
+                f"scale={gate.size_multiplier:.2f}, final={gate.final_signal or signal}, "
+                f"reason={gate.reason})"
+            )
+        gate_decision = self.cached_signal_gate
+        effective_signal = signal
+        if gate_decision and gate_decision.final_signal in (BUY, SELL, HOLD):
+            effective_signal = gate_decision.final_signal
+            if effective_signal != signal:
+                logger.info(f"  AI 최종 신호 적용: {signal} -> {effective_signal}")
+
         # 분 단위 계좌 스냅샷 (수익률 분석용)
         if signal_candle != self.last_snapshot_candle:
             self._log_account_snapshot("TICK")
@@ -298,7 +328,7 @@ class Trader:
                 return
 
             # 추세선(전략) 이탈은 트레일링 스탑보다 우선
-            if signal == SELL:
+            if effective_signal == SELL:
                 if self._is_duplicate_signal_order(signal_candle):
                     logger.info("  매도 차단: 같은 확정봉에서 중복 신호 주문 방지")
                     return
@@ -329,7 +359,7 @@ class Trader:
                 return
 
         # ---- 4. 매수 처리 ----
-        if signal == BUY:
+        if effective_signal == BUY:
             # ATR 기반 변동성 체크 (선택적)
             atr = 0
             avg_atr = 0
@@ -385,6 +415,14 @@ class Trader:
                         )
                         buy_amount = adjusted
 
+                    if gate_decision and not gate_decision.allow:
+                        logger.info(
+                            "  매수 차단: AI 분석 결과 "
+                            f"({gate_decision.source}, conf={gate_decision.confidence:.2f}) "
+                            f"{gate_decision.reason}"
+                        )
+                        return
+
                     if buy_amount < MIN_ORDER_KRW:
                         logger.info(
                             "  매수 차단: 최소주문금액 미만 "
@@ -392,27 +430,13 @@ class Trader:
                         )
                         return
 
-                    gate = self.llm_gate.evaluate_buy(
-                        market=self.market,
-                        strategy_name=self.strategy.name,
-                        signal_candle=signal_candle,
-                        current_price=float(current_price),
-                        signal_price=float(signal_price),
-                        df=signal_df,
-                    )
-                    if not gate.allow:
+                    if gate_decision and gate_decision.size_multiplier < 1.0:
+                        adjusted = buy_amount * gate_decision.size_multiplier
                         logger.info(
-                            "  매수 차단: LLM 게이트 "
-                            f"({gate.source}, conf={gate.confidence:.2f}) {gate.reason}"
-                        )
-                        return
-
-                    if gate.size_multiplier < 1.0:
-                        adjusted = buy_amount * gate.size_multiplier
-                        logger.info(
-                            "  매수 금액 조정: LLM 게이트 "
+                            "  매수 금액 조정: AI 분석 "
                             f"{buy_amount:,.0f} -> {adjusted:,.0f} KRW "
-                            f"(x{gate.size_multiplier:.2f}, conf={gate.confidence:.2f})"
+                            f"(x{gate_decision.size_multiplier:.2f}, "
+                            f"conf={gate_decision.confidence:.2f})"
                         )
                         buy_amount = adjusted
 
@@ -424,7 +448,15 @@ class Trader:
                 logger.info(f"  매수 차단: {reason}")
 
         # ---- 5. 매도 처리 ----
-        elif signal == SELL:
+        elif effective_signal == SELL:
+            if gate_decision and not gate_decision.allow:
+                logger.info(
+                    "  매도 보류: AI 분석 결과 "
+                    f"({gate_decision.source}, conf={gate_decision.confidence:.2f}) "
+                    f"{gate_decision.reason}"
+                )
+                return
+
             if self._is_duplicate_signal_order(signal_candle):
                 logger.info("  매도 차단: 같은 확정봉에서 중복 신호 주문 방지")
                 return
