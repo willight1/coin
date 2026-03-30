@@ -15,6 +15,7 @@ cp .env.example .env
 ./venv/bin/python main.py --mode trade
 ./venv/bin/python main.py --mode review
 ./venv/bin/python main.py --mode review --date 2026-03-28
+./venv/bin/python -m streamlit run dashboard.py
 ```
 
 ## 2) 전략별 트레이드 실행
