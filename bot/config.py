@@ -69,6 +69,9 @@ class RiskConfig:
     max_positions: int = 1              # 최대 동시 포지션 수 (0 이하면 제한 없음)
     cooldown_seconds: int = 300         # 주문 후 쿨다운 (초)
     max_consecutive_buy_signals: int = 2  # 연속 BUY 허용 횟수(2면 3번째부터 차단)
+    atr_reduce_mult: float = 2.0        # ATR 고변동 축소 진입 배수
+    atr_block_mult: float = 2.8         # ATR 초고변동 차단 배수
+    high_vol_buy_scale: float = 0.5     # 고변동 구간 매수금액 축소 비율
 
 
 # ============================================================
@@ -148,6 +151,9 @@ def load_config():
         max_positions=_int_env("MAX_POSITIONS", 1),
         cooldown_seconds=_int_env("COOLDOWN_SECONDS", 300),
         max_consecutive_buy_signals=_int_env("MAX_CONSECUTIVE_BUY_SIGNALS", 2),
+        atr_reduce_mult=_float_env("ATR_REDUCE_MULT", 2.0),
+        atr_block_mult=_float_env("ATR_BLOCK_MULT", 2.8),
+        high_vol_buy_scale=_float_env("HIGH_VOL_BUY_SCALE", 0.5),
     )
 
     return upbit_cfg, bot_cfg, bt_cfg, risk_cfg

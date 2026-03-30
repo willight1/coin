@@ -32,6 +32,7 @@ from .llm_gate import LLMGate
 
 logger = get_logger(__name__)
 MIN_ORDER_KRW = 5000.0
+DEFAULT_DRY_RUN_KRW = 1_000_000.0
 
 
 class Trader:
@@ -78,6 +79,11 @@ class Trader:
         self.estimated_roundtrip_cost_pct = (
             (BT_CFG.fee_rate + BT_CFG.slippage_rate) * 2 * 100
         )
+        self.virtual_krw_balance = float(
+            os.getenv("BOT_DRY_RUN_INITIAL_KRW", str(DEFAULT_DRY_RUN_KRW))
+        )
+        self.virtual_coin_balance = 0.0
+        self.virtual_avg_buy_price = 0.0
 
         # 거래 대상 화폐 코드 (예: "BTC")
         self.currency = self.market.split("-")[1] if "-" in self.market else ""
@@ -89,6 +95,8 @@ class Trader:
         logger.info(f"  최소 순이익 매도 기준: {RISK_CFG.min_net_profit_pct:.3f}%")
         logger.info(f"  LLM 게이트 사용: {self.llm_gate.enabled}")
         logger.info(f"  신호변경 로그 모드: {self.log_signal_change_only}")
+        if self.client.dry_run:
+            logger.info(f"  DRY_RUN 가상 KRW 초기자산: {self.virtual_krw_balance:,.0f}")
 
     def run(self) -> None:
         """
@@ -155,6 +163,10 @@ class Trader:
         봇 실행 전 수동 매수된 물량도 손절/트레일링/매도 로직에서 인식됩니다.
         """
         if self.state_synced or not self.currency:
+            return
+
+        if self.client.dry_run:
+            self.state_synced = True
             return
 
         try:
@@ -331,7 +343,7 @@ class Trader:
 
             # KRW 잔고 조회
             try:
-                krw_balance = self.client.get_balance("KRW")
+                krw_balance = self._get_krw_balance()
                 # 인증/API가 복구되면 주문 차단 플래그를 자동 해제
                 if self.risk_manager.state.api_failed:
                     self.risk_manager.set_api_failed(False)
@@ -364,6 +376,15 @@ class Trader:
 
                 buy_amount = self.risk_manager.get_buy_amount(krw_balance)
                 if buy_amount > 0:
+                    if reason.startswith("고변동 경고"):
+                        adjusted = buy_amount * self.risk_manager.high_vol_buy_scale
+                        logger.info(
+                            "  매수 금액 조정: 고변동 대응 "
+                            f"{buy_amount:,.0f} -> {adjusted:,.0f} KRW "
+                            f"(x{self.risk_manager.high_vol_buy_scale:.2f})"
+                        )
+                        buy_amount = adjusted
+
                     if buy_amount < MIN_ORDER_KRW:
                         logger.info(
                             "  매수 차단: 최소주문금액 미만 "
@@ -443,6 +464,32 @@ class Trader:
         logger.info(f"  >> 매수 실행: {amount:,.0f} KRW")
 
         try:
+            if self.client.dry_run:
+                if amount > self.virtual_krw_balance:
+                    logger.info(
+                        "  >> 매수 실패(DRY_RUN): 가상 KRW 부족 "
+                        f"({self.virtual_krw_balance:,.0f} < {amount:,.0f})"
+                    )
+                    return False
+                filled_volume = amount / current_price if current_price > 0 else 0.0
+                prev_cost = self.virtual_avg_buy_price * self.virtual_coin_balance
+                new_cost = prev_cost + amount
+                new_volume = self.virtual_coin_balance + filled_volume
+                self.virtual_krw_balance -= amount
+                self.virtual_coin_balance = new_volume
+                self.virtual_avg_buy_price = (
+                    (new_cost / new_volume) if new_volume > 0 else 0.0
+                )
+                result = {
+                    "uuid": f"dry_virtual_buy_{int(time.time())}",
+                    "state": "done",
+                    "price": amount,
+                    "filled_volume": filled_volume,
+                }
+                logger.info(f"  >> 주문 결과: {result}")
+                self.risk_manager.record_buy(self.market, current_price)
+                return True
+
             result = self.client.order_market_buy(
                 market=self.market, price=amount)
             logger.info(f"  >> 주문 결과: {result}")
@@ -465,12 +512,27 @@ class Trader:
 
         try:
             # 보유 수량 조회
-            volume = self.client.get_balance(self.currency)
+            volume = self._get_coin_balance()
 
             if volume <= 0:
                 logger.info("  >> 매도할 수량이 없습니다.")
                 self.risk_manager.record_sell(self.market)
                 return False
+
+            if self.client.dry_run:
+                proceeds = volume * current_price
+                self.virtual_krw_balance += proceeds
+                self.virtual_coin_balance = 0.0
+                self.virtual_avg_buy_price = 0.0
+                result = {
+                    "uuid": f"dry_virtual_sell_{int(time.time())}",
+                    "state": "done",
+                    "volume": volume,
+                    "proceeds": proceeds,
+                }
+                logger.info(f"  >> 주문 결과: {result}")
+                self.risk_manager.record_sell(self.market)
+                return True
 
             result = self.client.order_market_sell(
                 market=self.market, volume=volume)
@@ -499,8 +561,8 @@ class Trader:
     def _log_account_snapshot(self, label: str) -> None:
         """계좌 스냅샷(추정 총자산)을 로그로 남깁니다."""
         try:
-            krw_balance = self.client.get_balance("KRW")
-            coin_balance = self.client.get_balance(self.currency)
+            krw_balance = self._get_krw_balance()
+            coin_balance = self._get_coin_balance()
             ticker = self.client.get_ticker(self.market)
             current_price = float(ticker.get("trade_price", 0))
             coin_value = coin_balance * current_price
@@ -514,3 +576,15 @@ class Trader:
             logger.info(f"[계좌] {label} 스냅샷 실패: {e}")
         except Exception as e:
             logger.info(f"[계좌] {label} 스냅샷 예외: {e}")
+
+    def _get_krw_balance(self) -> float:
+        """KRW 잔고 조회 (DRY_RUN이면 가상잔고 반환)."""
+        if self.client.dry_run:
+            return self.virtual_krw_balance
+        return self.client.get_balance("KRW")
+
+    def _get_coin_balance(self) -> float:
+        """코인 잔고 조회 (DRY_RUN이면 가상잔고 반환)."""
+        if self.client.dry_run:
+            return self.virtual_coin_balance
+        return self.client.get_balance(self.currency)

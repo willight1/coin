@@ -66,7 +66,10 @@ class RiskManager:
                  stop_loss_pct: float = 0, take_profit_pct: float = 0,
                  trailing_stop_pct: float = 0, min_net_profit_pct: float = 0,
                  max_positions: int = 0, cooldown_seconds: int = 0,
-                 max_consecutive_buy_signals: int = 0):
+                 max_consecutive_buy_signals: int = 0,
+                 atr_reduce_mult: float = 0,
+                 atr_block_mult: float = 0,
+                 high_vol_buy_scale: float = 0):
         self.buy_ratio_pct = buy_ratio_pct or RISK_CFG.buy_ratio_pct
         self.min_krw_reserve = min_krw_reserve or RISK_CFG.min_krw_reserve
         self.stop_loss_pct = stop_loss_pct or RISK_CFG.stop_loss_pct
@@ -78,6 +81,9 @@ class RiskManager:
         self.max_consecutive_buy_signals = (
             max_consecutive_buy_signals or RISK_CFG.max_consecutive_buy_signals
         )
+        self.atr_reduce_mult = atr_reduce_mult or RISK_CFG.atr_reduce_mult
+        self.atr_block_mult = atr_block_mult or RISK_CFG.atr_block_mult
+        self.high_vol_buy_scale = high_vol_buy_scale or RISK_CFG.high_vol_buy_scale
 
         # 상태 초기화
         self.state = RiskState()
@@ -139,9 +145,12 @@ class RiskManager:
 
         # 7. 변동성 과다 체크 (ATR이 제공된 경우)
         if atr > 0 and avg_atr > 0:
-            if atr > avg_atr * 2.0:
+            if atr > avg_atr * self.atr_block_mult:
                 return False, (f"변동성 과다: ATR({atr:,.0f}) > "
-                             f"평균ATR({avg_atr:,.0f}) × 2")
+                             f"평균ATR({avg_atr:,.0f}) × {self.atr_block_mult:g}")
+            if atr > avg_atr * self.atr_reduce_mult:
+                return True, (f"고변동 경고: ATR({atr:,.0f}) > "
+                              f"평균ATR({avg_atr:,.0f}) × {self.atr_reduce_mult:g}")
 
         return True, "매수 가능"
 
