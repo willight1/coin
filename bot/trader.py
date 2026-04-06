@@ -259,6 +259,10 @@ class Trader:
         # 진행 중인 현재 봉은 제외하고 직전 확정봉 기준으로 신호를 계산합니다.
         signal_df = df.iloc[:-1].copy()
         signal = self.strategy.generate_signal(signal_df)
+        ai_driven = bool(getattr(self.strategy, "ai_driven", False))
+        ai_meta = {}
+        if ai_driven and hasattr(self.strategy, "get_last_ai_meta"):
+            ai_meta = self.strategy.get_last_ai_meta()
         signal_price = signal_df["close"].iloc[-1]
         signal_candle = str(
             signal_df["candle_date_time_kst"].iloc[-1]
@@ -275,33 +279,42 @@ class Trader:
         elif not self.log_signal_change_only:
             logger.info(f"  전략 신호: {signal} (확정봉: {signal_candle})")
 
-        signal_changed = signal != self.last_llm_signal
-        if signal_changed:
-            self.last_llm_signal = signal
-            self.cached_signal_gate = self.llm_gate.evaluate_signal(
-                signal=signal,
-                market=self.market,
-                strategy_name=self.strategy.name,
-                signal_candle=signal_candle,
-                current_price=float(current_price),
-                signal_price=float(signal_price),
-                df=signal_df,
-                has_position=self.risk_manager.state.current_positions > 0,
-            )
-            gate = self.cached_signal_gate
-            logger.info(
-                "  AI 신호 분석: "
-                f"{signal} -> {'ALLOW' if gate.allow else 'BLOCK'} "
-                f"(source={gate.source}, conf={gate.confidence:.2f}, "
-                f"scale={gate.size_multiplier:.2f}, final={gate.final_signal or signal}, "
-                f"reason={gate.reason})"
-            )
-        gate_decision = self.cached_signal_gate
+        gate_decision = None
         effective_signal = signal
-        if gate_decision and gate_decision.final_signal in (BUY, SELL, HOLD):
-            effective_signal = gate_decision.final_signal
-            if effective_signal != signal:
-                logger.info(f"  AI 최종 신호 적용: {signal} -> {effective_signal}")
+        if ai_driven:
+            logger.info(
+                "  AI 자율 신호: "
+                f"{effective_signal} (conf={float(ai_meta.get('confidence', 0.0)):.2f}, "
+                f"scale={float(ai_meta.get('size_multiplier', 1.0)):.2f}, "
+                f"reason={ai_meta.get('reason', '')})"
+            )
+        else:
+            signal_changed = signal != self.last_llm_signal
+            if signal_changed:
+                self.last_llm_signal = signal
+                self.cached_signal_gate = self.llm_gate.evaluate_signal(
+                    signal=signal,
+                    market=self.market,
+                    strategy_name=self.strategy.name,
+                    signal_candle=signal_candle,
+                    current_price=float(current_price),
+                    signal_price=float(signal_price),
+                    df=signal_df,
+                    has_position=self.risk_manager.state.current_positions > 0,
+                )
+                gate = self.cached_signal_gate
+                logger.info(
+                    "  AI 신호 분석: "
+                    f"{signal} -> {'ALLOW' if gate.allow else 'BLOCK'} "
+                    f"(source={gate.source}, conf={gate.confidence:.2f}, "
+                    f"scale={gate.size_multiplier:.2f}, final={gate.final_signal or signal}, "
+                    f"reason={gate.reason})"
+                )
+            gate_decision = self.cached_signal_gate
+            if gate_decision and gate_decision.final_signal in (BUY, SELL, HOLD):
+                effective_signal = gate_decision.final_signal
+                if effective_signal != signal:
+                    logger.info(f"  AI 최종 신호 적용: {signal} -> {effective_signal}")
 
         # 분 단위 계좌 스냅샷 (수익률 분석용)
         if signal_candle != self.last_snapshot_candle:
@@ -343,7 +356,7 @@ class Trader:
                     logger.info(f"  매도 보류: {min_profit_reason}")
                     return
                 allowed, reason = self.risk_manager.check_sell(
-                    signal, self.market, current_price)
+                    effective_signal, self.market, current_price)
                 if allowed:
                     if self._execute_sell(current_price, reason="TREND_EXIT"):
                         self.last_signal_order_candle = signal_candle
@@ -387,7 +400,7 @@ class Trader:
                 return
 
             allowed, reason = self.risk_manager.check_buy(
-                signal, krw_balance, current_price, atr, avg_atr)
+                effective_signal, krw_balance, current_price, atr, avg_atr)
 
             if allowed:
                 if self._is_duplicate_signal_order(signal_candle):
@@ -439,6 +452,19 @@ class Trader:
                             f"conf={gate_decision.confidence:.2f})"
                         )
                         buy_amount = adjusted
+                    elif ai_driven:
+                        ai_size_multiplier = max(0.0, min(1.0, float(ai_meta.get("size_multiplier", 1.0))))
+                        if ai_size_multiplier <= 0:
+                            logger.info("  매수 차단: AI 자율 전략 size_multiplier=0")
+                            return
+                        if ai_size_multiplier < 1.0:
+                            adjusted = buy_amount * ai_size_multiplier
+                            logger.info(
+                                "  매수 금액 조정: AI 자율 전략 "
+                                f"{buy_amount:,.0f} -> {adjusted:,.0f} KRW "
+                                f"(x{ai_size_multiplier:.2f})"
+                            )
+                            buy_amount = adjusted
 
                     if self._execute_buy(buy_amount, current_price):
                         self.last_signal_order_candle = signal_candle
@@ -473,7 +499,7 @@ class Trader:
                 return
 
             allowed, reason = self.risk_manager.check_sell(
-                signal, self.market, current_price)
+                effective_signal, self.market, current_price)
 
             if allowed:
                 if self._execute_sell(current_price, reason="TREND_EXIT"):
@@ -494,6 +520,7 @@ class Trader:
             current_price: 참고용 현재가
         """
         logger.info(f"  >> 매수 실행: {amount:,.0f} KRW")
+        self._log_trade_balance_snapshot("BUY", "BEFORE", current_price=current_price)
 
         try:
             if self.client.dry_run:
@@ -520,12 +547,14 @@ class Trader:
                 }
                 logger.info(f"  >> 주문 결과: {result}")
                 self.risk_manager.record_buy(self.market, current_price)
+                self._log_trade_balance_snapshot("BUY", "AFTER", current_price=current_price)
                 return True
 
             result = self.client.order_market_buy(
                 market=self.market, price=amount)
             logger.info(f"  >> 주문 결과: {result}")
             self.risk_manager.record_buy(self.market, current_price)
+            self._log_trade_balance_snapshot("BUY", "AFTER", current_price=current_price)
             return True
         except Exception as e:
             logger.error(f"  >> 매수 주문 실패: {e}")
@@ -541,8 +570,13 @@ class Trader:
             reason: 매도 사유 (TREND_EXIT, STOP_LOSS, TRAILING_STOP)
         """
         logger.info(f"  >> 매도 실행 (사유: {reason})")
+        self._log_trade_balance_snapshot("SELL", "BEFORE", current_price=current_price)
 
         try:
+            entry_price = self.risk_manager.state.entry_prices.get(self.market, 0.0)
+            if entry_price <= 0:
+                entry_price = self._get_avg_buy_price()
+
             # 보유 수량 조회
             volume = self._get_coin_balance()
 
@@ -553,6 +587,10 @@ class Trader:
 
             if self.client.dry_run:
                 proceeds = volume * current_price
+                cost_basis = volume * entry_price if entry_price > 0 else 0.0
+                pnl_krw = proceeds - cost_basis
+                pnl_pct = (pnl_krw / cost_basis * 100) if cost_basis > 0 else 0.0
+                est_net_pct = pnl_pct - self.estimated_roundtrip_cost_pct
                 self.virtual_krw_balance += proceeds
                 self.virtual_coin_balance = 0.0
                 self.virtual_avg_buy_price = 0.0
@@ -563,19 +601,63 @@ class Trader:
                     "proceeds": proceeds,
                 }
                 logger.info(f"  >> 주문 결과: {result}")
+                logger.info(
+                    "  >> 매도 정산: "
+                    f"수량={volume:.8f}, 매도금액={proceeds:,.0f} KRW, "
+                    f"원가={cost_basis:,.0f} KRW, 실현손익={pnl_krw:,.0f} KRW ({pnl_pct:.2f}%), "
+                    f"추정순이익률={est_net_pct:.2f}%"
+                )
                 self.risk_manager.record_sell(self.market)
+                self._log_trade_balance_snapshot("SELL", "AFTER", current_price=current_price)
                 return True
 
             result = self.client.order_market_sell(
                 market=self.market, volume=volume)
             logger.info(f"  >> 주문 결과: {result}")
+            proceeds = volume * current_price
+            cost_basis = volume * entry_price if entry_price > 0 else 0.0
+            pnl_krw = proceeds - cost_basis
+            pnl_pct = (pnl_krw / cost_basis * 100) if cost_basis > 0 else 0.0
+            est_net_pct = pnl_pct - self.estimated_roundtrip_cost_pct
+            logger.info(
+                "  >> 매도 정산(추정): "
+                f"수량={volume:.8f}, 매도금액≈{proceeds:,.0f} KRW, "
+                f"원가≈{cost_basis:,.0f} KRW, 실현손익≈{pnl_krw:,.0f} KRW ({pnl_pct:.2f}%), "
+                f"추정순이익률≈{est_net_pct:.2f}%"
+            )
             self.risk_manager.record_sell(self.market)
+            self._log_trade_balance_snapshot("SELL", "AFTER", current_price=current_price)
             return True
 
         except Exception as e:
             logger.error(f"  >> 매도 주문 실패: {e}")
             self.risk_manager.set_api_failed(True)
             return False
+
+    def _log_trade_balance_snapshot(
+        self,
+        side: str,
+        stage: str,
+        current_price: float = 0.0,
+    ) -> None:
+        """주문 전/후 자산 상태를 로그로 남깁니다."""
+        try:
+            price = float(current_price)
+            if price <= 0:
+                ticker = self.client.get_ticker(self.market)
+                price = float(ticker.get("trade_price", 0))
+            krw_balance = self._get_krw_balance()
+            coin_balance = self._get_coin_balance()
+            coin_value = coin_balance * price
+            equity = krw_balance + coin_value
+            logger.info(
+                f"  >> 자산[{side}:{stage}] "
+                f"krw={krw_balance:,.0f} coin={coin_balance:.8f} "
+                f"price={price:,.0f} coin_value={coin_value:,.0f} "
+                f"equity={equity:,.0f}"
+            )
+        except Exception as e:
+            logger.info(f"  >> 자산[{side}:{stage}] 조회 실패: {e}")
 
     def _is_duplicate_signal_order(self, signal_candle: str) -> bool:
         """같은 확정봉에서 신호 기반 주문이 중복되는 것을 방지합니다."""
@@ -595,14 +677,17 @@ class Trader:
         try:
             krw_balance = self._get_krw_balance()
             coin_balance = self._get_coin_balance()
+            avg_buy_price = self._get_avg_buy_price()
             ticker = self.client.get_ticker(self.market)
             current_price = float(ticker.get("trade_price", 0))
             coin_value = coin_balance * current_price
+            buy_cost = coin_balance * avg_buy_price
             equity = krw_balance + coin_value
             logger.info(
                 f"[계좌] {label} market={self.market} equity={equity:.2f} "
                 f"krw={krw_balance:.2f} coin={coin_balance:.8f} "
-                f"coin_value={coin_value:.2f} price={current_price:.2f}"
+                f"coin_value={coin_value:.2f} price={current_price:.2f} "
+                f"avg_buy={avg_buy_price:.2f} buy_cost={buy_cost:.2f}"
             )
         except UpbitClientError as e:
             logger.info(f"[계좌] {label} 스냅샷 실패: {e}")
@@ -620,3 +705,9 @@ class Trader:
         if self.client.dry_run:
             return self.virtual_coin_balance
         return self.client.get_balance(self.currency)
+
+    def _get_avg_buy_price(self) -> float:
+        """평균 매수가 조회 (DRY_RUN이면 가상 평단 반환)."""
+        if self.client.dry_run:
+            return self.virtual_avg_buy_price
+        return self.client.get_avg_buy_price(self.currency)

@@ -257,11 +257,11 @@ def run_trade(strategy_name: str = "") -> None:
         strategy = get_strategy_by_name(strategy_name)
         if strategy is None:
             logger.error(f"전략을 찾을 수 없습니다: '{strategy_name}'")
-            available = [s.name for s in get_all_strategies()]
+            available = ["AI 자율 매매"] + [s.name for s in get_all_strategies()]
             logger.info(f"사용 가능한 전략: {available}")
             return
     else:
-        preferred_name = "돌파 + 거래량 증가"
+        preferred_name = "AI 자율 매매"
         strategy = get_strategy_by_name(preferred_name)
         if strategy is None:
             strategies = get_all_strategies()
@@ -271,6 +271,12 @@ def run_trade(strategy_name: str = "") -> None:
             )
         else:
             logger.info(f"전략이 지정되지 않아 기본 선호 전략을 사용합니다: {strategy.name}")
+
+    if getattr(strategy, "ai_driven", False):
+        if not os.getenv("OPENAI_API_KEY", "").strip():
+            logger.error("AI 자율 매매 전략은 OPENAI_API_KEY가 필요합니다.")
+            logger.error(".env 파일에 OPENAI_API_KEY를 설정하세요.")
+            return
 
     markets = tuple(dict.fromkeys(UPBIT_CFG.markets or (UPBIT_CFG.market,)))
     if not markets:

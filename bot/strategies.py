@@ -1,11 +1,9 @@
 """
 strategies.py — 규칙 기반 전략 모듈
 ====================================
-모든 전략은 "명시적 수식 / 명시적 조건문"으로 표현됩니다.
-BUY / SELL / HOLD 신호는 항상 재현 가능합니다.
-
-AI가 실시간으로 판단하는 구조는 사용하지 않습니다.
-전략 함수가 반환하는 신호만 실거래에 사용됩니다.
+기본 제공 전략은 "명시적 수식 / 명시적 조건문"으로 표현됩니다.
+AI 자율 전략은 별도 모듈(`ai_strategy.py`)로 제공됩니다.
+전략 함수가 반환하는 신호(BUY / SELL / HOLD)를 실거래에 사용합니다.
 
 전략 목록:
 1. RSI 과매도/과매수 전략
@@ -838,10 +836,10 @@ def get_all_strategies() -> list[BaseStrategy]:
             vol_mult=1.2,
             exit_period=12,
             bb_period=20,
-            bb_std=1.8,
+            bb_std=1.6,
             rsi_period=14,
-            range_rsi_buy=40.0,
-            range_rsi_sell=60.0,
+            range_rsi_buy=45.0,
+            range_rsi_sell=62.0,
         ),
         RSIStrategy(),
         MACrossStrategy(),
@@ -867,6 +865,10 @@ def get_strategy_by_name(name: str) -> BaseStrategy | None:
     Returns:
         BaseStrategy 또는 None
     """
+    if name == "AI 자율 매매":
+        from .ai_strategy import AIAutonomousStrategy
+        return AIAutonomousStrategy()
+
     for strategy in get_all_strategies():
         if strategy.name == name:
             return strategy
