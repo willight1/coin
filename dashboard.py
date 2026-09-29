@@ -18,6 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from bot.config import BOT_CFG
 from bot.paths import PROJECT_ROOT
 from bot.strategies import get_all_strategies
 from bot.upbit_client import UpbitClient
@@ -627,7 +628,12 @@ def main() -> None:
     labels = [p.name for p in logs]
     selected = st.sidebar.selectbox("로그 선택", options=labels, index=0)
     market = st.sidebar.text_input("차트 마켓", value="KRW-BTC")
-    unit = st.sidebar.selectbox("봉 단위(분)", options=[1, 3, 5, 15, 30, 60, 240], index=0)
+    unit_options = [1, 3, 5, 15, 30, 60, 240]
+    unit = st.sidebar.selectbox(
+        "봉 단위(분)", options=unit_options,
+        index=unit_options.index(BOT_CFG.candle_unit)
+        if BOT_CFG.candle_unit in unit_options else 0,
+    )
     count = st.sidebar.slider("조회 캔들 수", min_value=50, max_value=500, value=200, step=10)
     render_controls(default_market=market)
     if st.sidebar.button("차트 새로고침"):

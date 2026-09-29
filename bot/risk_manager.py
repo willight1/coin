@@ -23,6 +23,9 @@ from .logger import get_logger
 
 logger = get_logger(__name__)
 
+# 업비트 KRW 마켓 최소 주문 금액
+MIN_ORDER_KRW = 5_000.0
+
 
 @dataclass
 class RiskState:
@@ -62,28 +65,20 @@ class RiskManager:
             logger.info(f"매수 차단: {reason}")
     """
 
-    def __init__(self, buy_ratio_pct: float = 0, min_krw_reserve: float = 0,
-                 stop_loss_pct: float = 0, take_profit_pct: float = 0,
-                 trailing_stop_pct: float = 0, min_net_profit_pct: float = 0,
-                 max_positions: int = 0, cooldown_seconds: int = 0,
-                 max_consecutive_buy_signals: int = 0,
-                 atr_reduce_mult: float = 0,
-                 atr_block_mult: float = 0,
-                 high_vol_buy_scale: float = 0):
-        self.buy_ratio_pct = buy_ratio_pct or RISK_CFG.buy_ratio_pct
-        self.min_krw_reserve = min_krw_reserve or RISK_CFG.min_krw_reserve
-        self.stop_loss_pct = stop_loss_pct or RISK_CFG.stop_loss_pct
-        self.take_profit_pct = take_profit_pct or RISK_CFG.take_profit_pct
-        self.trailing_stop_pct = trailing_stop_pct or RISK_CFG.trailing_stop_pct
-        self.min_net_profit_pct = min_net_profit_pct or RISK_CFG.min_net_profit_pct
-        self.max_positions = max_positions or RISK_CFG.max_positions
-        self.cooldown_seconds = cooldown_seconds or RISK_CFG.cooldown_seconds
-        self.max_consecutive_buy_signals = (
-            max_consecutive_buy_signals or RISK_CFG.max_consecutive_buy_signals
-        )
-        self.atr_reduce_mult = atr_reduce_mult or RISK_CFG.atr_reduce_mult
-        self.atr_block_mult = atr_block_mult or RISK_CFG.atr_block_mult
-        self.high_vol_buy_scale = high_vol_buy_scale or RISK_CFG.high_vol_buy_scale
+    # 인자를 생략(None)하면 .env/config 기본값을 쓴다.
+    # 0 을 넘기면 0 이 적용된다 (0 은 '손절 비활성' 같은 유효한 값이다).
+    def __init__(self, **overrides):
+        for key in (
+            "buy_ratio_pct", "min_krw_reserve", "stop_loss_pct",
+            "take_profit_pct", "trailing_stop_pct", "min_net_profit_pct",
+            "max_positions", "cooldown_seconds", "max_consecutive_buy_signals",
+            "atr_reduce_mult", "atr_block_mult", "high_vol_buy_scale",
+        ):
+            value = overrides.pop(key, None)
+            setattr(self, key,
+                    getattr(RISK_CFG, key) if value is None else value)
+        if overrides:
+            raise TypeError(f"알 수 없는 리스크 설정: {sorted(overrides)}")
 
         # 상태 초기화
         self.state = RiskState()
@@ -93,7 +88,8 @@ class RiskManager:
     # ============================================================
     def check_buy(self, signal: str, krw_balance: float,
                   current_price: float = 0,
-                  atr: float = 0, avg_atr: float = 0) -> tuple[bool, str]:
+                  atr: float = 0, avg_atr: float = 0,
+                  now: float = 0) -> tuple[bool, str]:
         """
         매수 가능 여부를 확인합니다.
         모든 리스크 조건을 순서대로 검사합니다.
@@ -104,6 +100,7 @@ class RiskManager:
             current_price: 현재가 (변동성 체크에 사용)
             atr: 현재 ATR (변동성 판단)
             avg_atr: 평균 ATR (변동성 비교 기준)
+            now: 기준 시각 (0이면 현재 시각. 백테스트는 봉 시각을 넘긴다)
 
         Returns:
             tuple: (허용 여부, 사유 문자열)
@@ -129,7 +126,7 @@ class RiskManager:
 
         # 5. 쿨다운 확인
         if self.state.last_order_time > 0:
-            elapsed = time.time() - self.state.last_order_time
+            elapsed = (now or time.time()) - self.state.last_order_time
             if elapsed < self.cooldown_seconds:
                 remaining = self.cooldown_seconds - elapsed
                 return False, f"쿨다운 중: {remaining:.0f}초 남음"
@@ -329,10 +326,10 @@ class RiskManager:
         buy_amount = available * self.buy_ratio_pct
         return max(buy_amount, 0)
 
-    def record_buy(self, market: str, price: float) -> None:
+    def record_buy(self, market: str, price: float, now: float = 0) -> None:
         """매수 체결 후 상태를 업데이트합니다."""
         self.state.current_positions += 1
-        self.state.last_order_time = time.time()
+        self.state.last_order_time = now or time.time()
         self.state.entry_prices[market] = price
         self.state.peak_prices[market] = price
 
@@ -343,12 +340,12 @@ class RiskManager:
             self.state.consecutive_same_signal = 1
         self.state.last_signal = "BUY"
 
-        logger.info(f"[리스크] 매수 기록: {market} @ {price:,.0f}")
+        logger.debug(f"[리스크] 매수 기록: {market} @ {price:,.0f}")
 
-    def record_sell(self, market: str) -> None:
+    def record_sell(self, market: str, now: float = 0) -> None:
         """매도 체결 후 상태를 업데이트합니다."""
         self.state.current_positions = max(0, self.state.current_positions - 1)
-        self.state.last_order_time = time.time()
+        self.state.last_order_time = now or time.time()
 
         if market in self.state.entry_prices:
             del self.state.entry_prices[market]
@@ -362,7 +359,7 @@ class RiskManager:
             self.state.consecutive_same_signal = 1
         self.state.last_signal = "SELL"
 
-        logger.info(f"[리스크] 매도 기록: {market}")
+        logger.debug(f"[리스크] 매도 기록: {market}")
 
     def set_api_failed(self, failed: bool = True) -> None:
         """API 실패 상태를 설정합니다."""

@@ -204,13 +204,14 @@ class Validator:
                     f"편차 {gap_ratio:.1f}%"
                 )
 
-        # 아웃오브샘플에서 큰 손실 발생 시 경고
-        if result_out.total_return_pct < -10:
-            vr.warnings.append(
-                f"아웃오브샘플에서 큰 손실: {result_out.total_return_pct:.2f}%"
-            )
+        # 아웃오브샘플에서 돈을 벌지 못하면 탈락.
+        # 인샘플 수익은 파라미터를 맞춰 넣은 결과일 수 있으므로 근거가 되지 못한다.
+        if result_out.total_return_pct <= 0:
             vr.passed = False
-            vr.reasons.append("아웃오브샘플 검증 실패 (손실 -10% 초과)")
+            vr.reasons.append(
+                f"아웃오브샘플 수익 없음: {result_out.total_return_pct:.2f}% "
+                f"(인샘플 {result_in.total_return_pct:.2f}%)"
+            )
 
         logger.info(
             f"분할 검증 [{strategy.name}] — "
@@ -288,18 +289,18 @@ class Validator:
 
         return validations
 
-    def select_live_strategy(self, results: list[BacktestResult]
-                             ) -> BaseStrategy | None:
+    def select_live_strategy(self, validations: list[ValidationResult]
+                             ) -> str | None:
         """
         검증을 통과한 전략 중 최고 점수 전략을 실거래 후보로 선택합니다.
 
         Args:
-            results: 백테스트 결과 리스트
+            validations: 검증 결과 리스트 (점수 내림차순)
 
         Returns:
             str 또는 None: 선택된 전략 이름 (통과 전략이 없으면 None)
         """
-        validations = self.compare_strategies(results)
+        validations = sorted(validations, key=lambda v: v.score, reverse=True)
 
         # 검증 통과한 전략만 필터
         passed = [v for v in validations if v.passed]
@@ -321,8 +322,8 @@ class Validator:
         print("\n" + "=" * 80)
         print("  전략 검증 결과 비교")
         print("=" * 80)
-        print(f"  {'전략':<25} {'결과':<8} {'점수':>8} {'수익률':>10} "
-              f"{'승률':>8} {'MDD':>8} {'PF':>8}")
+        print(f"  {'전략':<25} {'결과':<8} {'점수':>8} {'인샘플':>9} "
+              f"{'아웃오브':>9} {'승률':>8} {'MDD':>8} {'PF':>8}")
         print("-" * 80)
 
         for vr in validations:
@@ -333,8 +334,10 @@ class Validator:
             mdd = r.max_drawdown_pct if r else 0
             pf = r.profit_factor if r else 0
 
+            oos = (f"{vr.out_sample_result.total_return_pct:>8.2f}%"
+                   if vr.out_sample_result else f"{'-':>9}")
             print(f"  {vr.strategy_name:<25} {status:<8} "
-                  f"{vr.score:>7.1f} {ret:>9.2f}% "
+                  f"{vr.score:>7.1f} {ret:>8.2f}% {oos} "
                   f"{wr:>7.1f}% {mdd:>7.2f}% {pf:>7.2f}")
 
             # 실패 사유 출력

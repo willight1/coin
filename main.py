@@ -36,6 +36,9 @@ from bot.review_agent import ReviewAgent
 
 logger = get_logger(__name__)
 
+# 백테스트/검증에 사용할 캔들 수 (봉 단위는 BOT_CANDLE_UNIT, 기본 15분)
+BACKTEST_CANDLES = 20_000
+
 
 # ============================================================
 # 샘플 데이터 생성 (API 키 없을 때 백테스트용)
@@ -171,14 +174,15 @@ def run_backtest() -> None:
 
     # 데이터 로드
     client = UpbitClient(dry_run=True)
-    df = load_market_data(client, UPBIT_CFG.market, count=2000, unit=1)
+    df = load_market_data(client, UPBIT_CFG.market, count=BACKTEST_CANDLES,
+                         unit=BOT_CFG.candle_unit)
 
     if df.empty:
         logger.error("시세 데이터가 비어 있습니다. 종료합니다.")
         return
 
     # 백테스터 생성
-    bt = Backtester()
+    bt = Backtester(candle_seconds=BOT_CFG.candle_unit * 60)
 
     # 모든 전략 백테스트
     strategies = get_all_strategies()
@@ -208,30 +212,27 @@ def run_validate() -> None:
 
     # 데이터 로드
     client = UpbitClient(dry_run=True)
-    df = load_market_data(client, UPBIT_CFG.market, count=2000, unit=1)
+    df = load_market_data(client, UPBIT_CFG.market, count=BACKTEST_CANDLES,
+                         unit=BOT_CFG.candle_unit)
 
     if df.empty:
         logger.error("시세 데이터가 비어 있습니다. 종료합니다.")
         return
 
     # 백테스터 & 검증기 생성
-    bt = Backtester()
+    bt = Backtester(candle_seconds=BOT_CFG.candle_unit * 60)
     validator = Validator()
 
-    # 모든 전략 백테스트
-    strategies = get_all_strategies()
-    results = []
-
-    for strategy in strategies:
-        result = bt.run(strategy, df)
-        results.append(result)
-
-    # 검증 비교
-    validations = validator.compare_strategies(results)
+    # 인샘플/아웃오브샘플 분리 검증 (과최적화 방지)
+    validations = [
+        validator.validate_with_split(strategy, df, bt)
+        for strategy in get_all_strategies()
+    ]
+    validations.sort(key=lambda v: v.score, reverse=True)
     validator.print_comparison(validations)
 
     # 실거래 후보 선택
-    best_name = validator.select_live_strategy(results)
+    best_name = validator.select_live_strategy(validations)
     if best_name:
         print(f"\n✅ 실거래 추천 전략: {best_name}")
         print(f"   다음 명령으로 실거래를 시작하세요:")
@@ -310,7 +311,7 @@ def run_trade(strategy_name: str = "") -> None:
                 client=client,
                 risk_manager=risk_manager,
                 market=market,
-                candle_unit=1,
+                candle_unit=BOT_CFG.candle_unit,
             )
             trader.run()
             return
@@ -321,12 +322,14 @@ def run_trade(strategy_name: str = "") -> None:
         for market in markets:
             traders.append(
                 Trader(
-                    strategy=strategy,
+                    # 마켓별 독립 인스턴스: AI 전략은 캔들 시각으로 신호를 캐시하므로
+                    # 인스턴스를 공유하면 다른 마켓의 신호를 그대로 재사용하게 된다.
+                    strategy=get_strategy_by_name(strategy.name) or strategy,
                     client=UpbitClient(dry_run=BOT_CFG.dry_run),
                     risk_manager=RiskManager(),
                     market=market,
                     interval=BOT_CFG.interval_seconds,
-                    candle_unit=1,
+                    candle_unit=BOT_CFG.candle_unit,
                 )
             )
 

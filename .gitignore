@@ -28,3 +28,6 @@ reports/
 # Local temp / notes
 *.log
 *.tmp
+
+# Claude Code 로컬 설정 (사용자별, 공유하지 않음)
+.claude/settings.local.json

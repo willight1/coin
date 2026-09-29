@@ -34,12 +34,17 @@ class UpbitConfig:
 # ============================================================
 # 봇 기본 설정
 # ============================================================
+# 업비트가 지원하는 분봉 단위
+SUPPORTED_CANDLE_UNITS = (1, 3, 5, 10, 15, 30, 60, 240)
+
+
 @dataclass(frozen=True)
 class BotConfig:
     """봇 실행에 필요한 기본 설정"""
     interval_seconds: int = 10          # 시세 조회 주기 (초)
     dry_run: bool = True                # True면 실제 주문 실행 안 함
     log_level: str = "INFO"             # 로그 레벨
+    candle_unit: int = 15               # 분봉 단위. 백테스트/검증/실거래가 같은 값을 쓴다.
 
 
 # ============================================================
@@ -99,6 +104,12 @@ def _int_env(key: str, default: int) -> int:
         return default
 
 
+def _candle_unit_env(key: str, default: int) -> int:
+    """분봉 단위 환경변수를 파싱합니다. 업비트가 지원하지 않는 값이면 기본값을 씁니다."""
+    unit = _int_env(key, default)
+    return unit if unit in SUPPORTED_CANDLE_UNITS else default
+
+
 def _markets_env(key: str, default_market: str) -> tuple[str, ...]:
     """콤마 구분 마켓 목록 환경변수를 파싱합니다."""
     raw = os.getenv(key, "").strip()
@@ -132,6 +143,7 @@ def load_config():
         interval_seconds=_int_env("BOT_INTERVAL_SECONDS", 10),
         dry_run=_bool_env("BOT_DRY_RUN", True),
         log_level=os.getenv("BOT_LOG_LEVEL", "INFO"),
+        candle_unit=_candle_unit_env("BOT_CANDLE_UNIT", 15),
     )
 
     bt_cfg = BacktestConfig(
