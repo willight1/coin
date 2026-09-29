@@ -31,6 +31,7 @@ from .indicators import (
     calc_bollinger_bands, calc_volume_sma,
     is_high_breakout, calc_atr,
 )
+from .config import _float_env
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -49,6 +50,10 @@ class BaseStrategy(ABC):
     모든 전략의 기본 클래스.
     전략을 구현하려면 이 클래스를 상속하고 generate_signal()을 구현하세요.
     """
+
+    # 이 전략에 맞는 리스크 설정 (RiskManager 인자). 백테스터/트레이더가
+    # risk_manager 를 따로 받지 않으면 이 값으로 RiskManager 를 만든다.
+    risk_overrides: dict = {}
 
     @property
     @abstractmethod
@@ -820,6 +825,51 @@ class DailySurvivalTrendStrategy(BaseStrategy):
 # ============================================================
 # 전략 레지스트리 — 사용 가능한 전략 목록
 # ============================================================
+class SmaTrendStrategy(BaseStrategy):
+    """
+    일봉 종가가 SMA 위면 보유, 아래면 현금. 하락장 회피용 저빈도 추세 필터.
+    측정 근거는 CLAUDE.md '일봉 추세 필터' 참고 (BOT_CANDLE_UNIT=1440 전제).
+    """
+
+    # 추세 신호만으로 사고팔게 부가 규칙을 끈다. 트레일링/손절/순이익 게이트가
+    # 켜져 있으면 추세 중간에 털려서 측정한 결과와 다른 전략이 된다.
+    risk_overrides = {
+        # 전역 BUY_RATIO_PCT(15분봉용 0.30)와 분리. 1.0 = 측정 기준(MDD 56%), 0.5 = MDD 40%
+        "buy_ratio_pct": _float_env("TREND_BUY_RATIO_PCT", 1.0),
+        "stop_loss_pct": 0,
+        "trailing_stop_pct": 0,
+        "take_profit_pct": 0,
+        "min_net_profit_pct": -1e9,
+        "cooldown_seconds": 0,
+        "max_consecutive_buy_signals": 0,
+        "atr_reduce_mult": 1e9,
+        "atr_block_mult": 1e9,
+    }
+
+    # ponytail: 트레이더는 업비트 제한으로 200봉만 받으므로 period < 200 이어야
+    # 신호가 난다. SMA200 을 쓰려면 트레이더 캔들 조회에 페이지네이션이 필요하다.
+    def __init__(self, period: int = 50):
+        self.period = period
+
+    @property
+    def name(self) -> str:
+        return f"일봉 SMA{self.period} 추세"
+
+    @property
+    def description(self) -> str:
+        return f"종가 > SMA{self.period} 이면 보유, 아래로 내려가면 전량 매도"
+
+    def generate_signal(self, df: pd.DataFrame) -> str:
+        return self.generate_signals_series(df).iloc[-1]
+
+    def generate_signals_series(self, df: pd.DataFrame) -> pd.Series:
+        sma = df["close"].rolling(self.period).mean()
+        signals = pd.Series(HOLD, index=df.index)
+        signals[df["close"] > sma] = BUY
+        signals[df["close"] < sma] = SELL
+        return signals
+
+
 def get_all_strategies() -> list[BaseStrategy]:
     """
     모든 기본 전략 인스턴스를 반환합니다.
@@ -852,6 +902,7 @@ def get_all_strategies() -> list[BaseStrategy]:
             exit_period=10,
             sell_confirm_bars=3,
         ),
+        SmaTrendStrategy(50),
     ]
 
 

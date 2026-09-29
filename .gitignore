@@ -24,6 +24,7 @@ env/
 # Runtime outputs
 logs/
 reports/
+state/
 
 # Local temp / notes
 *.log

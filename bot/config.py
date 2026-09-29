@@ -34,8 +34,10 @@ class UpbitConfig:
 # ============================================================
 # 봇 기본 설정
 # ============================================================
-# 업비트가 지원하는 분봉 단위
-SUPPORTED_CANDLE_UNITS = (1, 3, 5, 10, 15, 30, 60, 240)
+# 업비트가 지원하는 분봉 단위. 1440 은 일봉(/v1/candles/days) — 분 단위로 두면
+# 봉 길이 계산(unit * 60초)이 모든 경로에서 그대로 맞는다.
+DAY_CANDLE_UNIT = 1440
+SUPPORTED_CANDLE_UNITS = (1, 3, 5, 10, 15, 30, 60, 240, DAY_CANDLE_UNIT)
 
 
 @dataclass(frozen=True)
@@ -44,7 +46,7 @@ class BotConfig:
     interval_seconds: int = 10          # 시세 조회 주기 (초)
     dry_run: bool = True                # True면 실제 주문 실행 안 함
     log_level: str = "INFO"             # 로그 레벨
-    candle_unit: int = 15               # 분봉 단위. 백테스트/검증/실거래가 같은 값을 쓴다.
+    candle_unit: int = 15               # 분봉 단위(1440=일봉). 백테스트/검증/실거래가 같은 값을 쓴다.
 
 
 # ============================================================

@@ -84,18 +84,19 @@ class Backtester:
         initial_capital: 초기 자본 (KRW)
         fee_rate: 수수료율
         slippage_rate: 슬리피지율
-        max_chase_pct: 신호봉 대비 최대 추격매수 허용폭
         candle_seconds: 봉 하나의 길이(초) — 쿨다운 판정에 사용
     """
 
-    def __init__(self, initial_capital: float = 0, fee_rate: float = 0,
-                 slippage_rate: float = 0,
-                 max_chase_pct: float = 0,
+    def __init__(self, initial_capital: float | None = None,
+                 fee_rate: float | None = None,
+                 slippage_rate: float | None = None,
                  candle_seconds: int = 60):
-        self.initial_capital = initial_capital or BT_CFG.initial_capital
-        self.fee_rate = fee_rate or BT_CFG.fee_rate
-        self.slippage_rate = slippage_rate or BT_CFG.slippage_rate
-        self.max_chase_pct = max_chase_pct or RISK_CFG.max_chase_pct
+        # 0 도 유효한 값(비용 0 진단 등) — `x or 기본값` 은 0 을 기본값으로 되돌린다
+        def _pick(v, default):
+            return default if v is None else v
+        self.initial_capital = _pick(initial_capital, BT_CFG.initial_capital)
+        self.fee_rate = _pick(fee_rate, BT_CFG.fee_rate)
+        self.slippage_rate = _pick(slippage_rate, BT_CFG.slippage_rate)
         self.candle_seconds = candle_seconds
         # 실거래(trader.py)와 동일한 왕복 비용 추정치
         self.roundtrip_cost_pct = (self.fee_rate + self.slippage_rate) * 2 * 100
@@ -106,7 +107,7 @@ class Backtester:
         전략을 백테스트합니다.
 
         실거래(trader.py)와 동일한 의사결정 경로를 사용합니다:
-        - 신호는 직전 확정봉 기준 (signals.shift(1))
+        - 신호는 직전 확정봉 기준 (signals.shift(1)), 매수·추세매도 모두 다음 봉 시가 체결
         - 체결은 다음 봉 시가 + 슬리피지, 수수료는 금액에서 차감
         - 손절/익절/추세매도/트레일링 판단은 RiskManager 를 그대로 호출
         - 매수 금액, 쿨다운, 최대 포지션 수, 추격매수 제한, 최소주문금액 모두 적용
@@ -127,7 +128,7 @@ class Backtester:
                      f"슬리피지: {self.slippage_rate * 100:.3f}%")
 
         market = "BACKTEST"
-        rm = risk_manager or RiskManager()
+        rm = risk_manager or RiskManager(**strategy.risk_overrides)
         rm.reset()
 
         cash = self.initial_capital   # 현금 보유량
@@ -194,24 +195,26 @@ class Backtester:
                 rm.update_peak_price(market, bar_high)
                 peak_price = rm.state.peak_prices.get(market, 0.0)
 
+                # 추세매도: 직전 확정봉 SELL 신호 -> 이번 봉 시가 체결 (매수와 같은 체결 모델).
+                # 트레이더는 새 봉이 열리자마자 현재가로 팔므로 봉 안의 손절/트레일링보다 먼저다.
+                if (signal == SELL
+                        and rm.check_min_net_profit_exit(
+                            market, bar_open, self.roundtrip_cost_pct)[0]
+                        and rm.check_sell(signal, market, bar_open)[0]):
+                    _close_position(bar_open * (1 - self.slippage_rate),
+                                    "TREND_EXIT", timestamp, now)
+
                 # 손절: 봉 저가가 손절선을 건드리면 손절선에서 체결
-                if rm.check_stop_loss(market, bar_low)[0]:
+                elif rm.check_stop_loss(market, bar_low)[0]:
                     level = entry_price * (1 - rm.stop_loss_pct)
                     _close_position(level * (1 - self.slippage_rate),
                                     "STOP_LOSS", timestamp, now)
 
-                # 익절 / 추세매도 / 트레일링은 종가 기준으로 판단
+                # 익절은 종가 기준으로 판단
                 elif rm.check_take_profit_net(
                         market, bar_close, self.roundtrip_cost_pct)[0]:
                     _close_position(bar_close * (1 - self.slippage_rate),
                                     "TAKE_PROFIT", timestamp, now)
-
-                elif (signal == SELL
-                        and rm.check_min_net_profit_exit(
-                            market, bar_close, self.roundtrip_cost_pct)[0]
-                        and rm.check_sell(signal, market, bar_close)[0]):
-                    _close_position(bar_close * (1 - self.slippage_rate),
-                                    "TREND_EXIT", timestamp, now)
 
                 # 트레일링: 봉 저가가 되돌림 기준을 건드리면 그 선에서 체결
                 elif rm.check_trailing_stop(market, bar_low)[0]:
@@ -229,12 +232,9 @@ class Backtester:
                     pass
                 else:
                     buy_price = bar_open * (1 + self.slippage_rate)
-                    signal_price = signal_prices.iloc[i]
-                    chase_pct = ((bar_open - signal_price) / signal_price
-                                 if signal_price and signal_price > 0 else 0.0)
-
-                    if chase_pct > self.max_chase_pct:
-                        pass  # 추격매수 제한 초과
+                    chase_ok, _ = rm.check_chase(signal_prices.iloc[i], bar_open)
+                    if not chase_ok:
+                        pass
                     else:
                         amount = rm.get_buy_amount(cash)
                         if reason.startswith("고변동 경고"):

@@ -628,7 +628,7 @@ def main() -> None:
     labels = [p.name for p in logs]
     selected = st.sidebar.selectbox("로그 선택", options=labels, index=0)
     market = st.sidebar.text_input("차트 마켓", value="KRW-BTC")
-    unit_options = [1, 3, 5, 15, 30, 60, 240]
+    unit_options = [1, 3, 5, 15, 30, 60, 240, 1440]
     unit = st.sidebar.selectbox(
         "봉 단위(분)", options=unit_options,
         index=unit_options.index(BOT_CFG.candle_unit)

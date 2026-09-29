@@ -323,7 +323,7 @@ class Validator:
         print("  전략 검증 결과 비교")
         print("=" * 80)
         print(f"  {'전략':<25} {'결과':<8} {'점수':>8} {'인샘플':>9} "
-              f"{'아웃오브':>9} {'승률':>8} {'MDD':>8} {'PF':>8}")
+              f"{'아웃오브':>9} {'승률':>8} {'MDD':>8} {'PF':>8} {'OOS PF':>8}")
         print("-" * 80)
 
         for vr in validations:
@@ -336,9 +336,11 @@ class Validator:
 
             oos = (f"{vr.out_sample_result.total_return_pct:>8.2f}%"
                    if vr.out_sample_result else f"{'-':>9}")
+            oos_pf = (f"{vr.out_sample_result.profit_factor:>8.2f}"
+                      if vr.out_sample_result else f"{'-':>8}")
             print(f"  {vr.strategy_name:<25} {status:<8} "
                   f"{vr.score:>7.1f} {ret:>8.2f}% {oos} "
-                  f"{wr:>7.1f}% {mdd:>7.2f}% {pf:>7.2f}")
+                  f"{wr:>7.1f}% {mdd:>7.2f}% {pf:>7.2f} {oos_pf}")
 
             # 실패 사유 출력
             for reason in vr.reasons:

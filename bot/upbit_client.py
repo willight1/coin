@@ -21,7 +21,7 @@ from urllib.parse import urlencode, unquote
 import jwt
 import requests
 
-from .config import UPBIT_CFG
+from .config import UPBIT_CFG, DAY_CANDLE_UNIT
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -176,13 +176,20 @@ class UpbitClient:
             return result[0]
         return result
 
+    @staticmethod
+    def candles_endpoint(unit: int) -> str:
+        """봉 단위에 맞는 캔들 엔드포인트 (1440 = 일봉)."""
+        if unit == DAY_CANDLE_UNIT:
+            return "/v1/candles/days"
+        return f"/v1/candles/minutes/{unit}"
+
     def get_candles_minutes(self, unit: int = 1, market: str | None = None,
                            count: int = 200) -> list[dict]:
         """
         분봉 캔들 데이터를 조회합니다.
 
         Args:
-            unit: 분 단위 (1, 3, 5, 15, 30, 60, 240)
+            unit: 분 단위 (1, 3, 5, 15, 30, 60, 240, 1440=일봉)
             market: 마켓 코드
             count: 조회할 캔들 수 (최대 200)
 
@@ -191,7 +198,7 @@ class UpbitClient:
         """
         market = market or UPBIT_CFG.market
         params = {"market": market, "count": min(count, 200)}
-        return self._request("GET", f"/v1/candles/minutes/{unit}", params=params)
+        return self._request("GET", self.candles_endpoint(unit), params=params)
 
     def get_candles_days(self, market: str | None = None,
                         count: int = 200) -> list[dict]:

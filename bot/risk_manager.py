@@ -73,6 +73,7 @@ class RiskManager:
             "take_profit_pct", "trailing_stop_pct", "min_net_profit_pct",
             "max_positions", "cooldown_seconds", "max_consecutive_buy_signals",
             "atr_reduce_mult", "atr_block_mult", "high_vol_buy_scale",
+            "max_chase_pct",
         ):
             value = overrides.pop(key, None)
             setattr(self, key,
@@ -194,6 +195,9 @@ class RiskManager:
         Returns:
             tuple: (손절 필요 여부, 사유)
         """
+        if self.stop_loss_pct <= 0:
+            return False, ""  # 0 = 손절 비활성 (없으면 0% 하락에도 손절된다)
+
         entry_price = self.state.entry_prices.get(market, 0)
         if entry_price <= 0:
             return False, "진입가 기록 없음"
@@ -305,6 +309,22 @@ class RiskManager:
                 f"익절 도달: 순이익 {net_pct:.2f}% >= 목표 {target_pct:.2f}%"
             )
         return False, ""
+
+    def check_chase(self, signal_price: float, fill_price: float
+                    ) -> tuple[bool, str]:
+        """
+        신호봉 종가 대비 체결 예정가가 max_chase_pct 넘게 올랐으면 매수를 막습니다.
+        신호가가 없으면(0/NaN) 판정하지 않고 통과시킵니다.
+        """
+        if not signal_price or not signal_price > 0:
+            return True, ""
+        chase_pct = (fill_price - signal_price) / signal_price
+        if chase_pct > self.max_chase_pct:
+            return False, (
+                f"추격매수 제한 초과 (현재 {chase_pct * 100:.2f}% > "
+                f"허용 {self.max_chase_pct * 100:.2f}%)"
+            )
+        return True, ""
 
     # ============================================================
     # 상태 업데이트

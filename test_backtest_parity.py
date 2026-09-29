@@ -81,12 +81,13 @@ def run_trader(strategy, df: pd.DataFrame) -> float:
     trader = Trader(
         strategy=strategy,
         client=client,
-        risk_manager=RiskManager(),
+        risk_manager=RiskManager(**strategy.risk_overrides),
         market="KRW-TEST",
         candle_unit=1,
         candle_count=200,
     )
     trader.virtual_krw_balance = BT_CFG.initial_capital
+    trader.state_path = None  # 가상 잔고 파일을 읽거나 남기지 않는다
 
     for i in range(len(df)):
         client.cursor = i
@@ -101,7 +102,49 @@ def run_trader(strategy, df: pd.DataFrame) -> float:
     return equity
 
 
+def check_rules() -> None:
+    """패리티 캔들로는 발동하지 않는 판정들을 직접 확인한다."""
+    rm = RiskManager(max_chase_pct=0.004)
+    assert rm.check_chase(100.0, 100.3)[0]           # +0.3% 허용
+    assert not rm.check_chase(100.0, 100.5)[0]       # +0.5% 차단
+    assert rm.check_chase(0, 200.0)[0]               # 신호가 없음 -> 통과
+    assert rm.check_chase(float("nan"), 200.0)[0]
+    assert not RiskManager(max_chase_pct=0).check_chase(100.0, 100.01)[0]  # 0 은 유효값
+
+    rm = RiskManager(stop_loss_pct=0)                # 0 = 손절 비활성
+    rm.record_buy("M", 100.0, now=1)
+    assert not rm.check_stop_loss("M", 1.0)[0]
+    rm = RiskManager(stop_loss_pct=0.03)
+    rm.record_buy("M", 100.0, now=1)
+    assert rm.check_stop_loss("M", 97.0)[0] and not rm.check_stop_loss("M", 97.5)[0]
+
+
+def check_dry_run_state() -> None:
+    """DRY_RUN 가상 잔고가 재시작 후에도 그대로 복원되는지 확인한다."""
+    import tempfile
+    path = os.path.join(tempfile.mkdtemp(), "state.json")
+    strategy = get_all_strategies()[0]
+
+    t = Trader(strategy=strategy, client=FakeClient(make_candles(5)),
+               risk_manager=RiskManager(), market="KRW-TEST")
+    t.state_path = path
+    t.virtual_krw_balance, t.virtual_coin_balance, t.virtual_avg_buy_price = 123.0, 0.5, 1000.0
+    t.risk_manager.record_buy("KRW-TEST", 990.0, now=1)
+    t._save_dry_run_state()
+
+    t2 = Trader(strategy=strategy, client=FakeClient(make_candles(5)),
+                risk_manager=RiskManager(), market="KRW-TEST")
+    t2.state_path = path
+    t2._sync_existing_position()
+    assert (t2.virtual_krw_balance, t2.virtual_coin_balance,
+            t2.virtual_avg_buy_price) == (123.0, 0.5, 1000.0)
+    assert t2.risk_manager.state.entry_prices["KRW-TEST"] == 990.0
+    assert t2.risk_manager.state.current_positions == 1
+
+
 def main() -> None:
+    check_rules()
+    check_dry_run_state()
     df = make_candles()
     failures = []
 
