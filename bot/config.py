@@ -46,7 +46,7 @@ class BotConfig:
     interval_seconds: int = 10          # 시세 조회 주기 (초)
     dry_run: bool = True                # True면 실제 주문 실행 안 함
     log_level: str = "INFO"             # 로그 레벨
-    candle_unit: int = 15               # 분봉 단위(1440=일봉). 백테스트/검증/실거래가 같은 값을 쓴다.
+    candle_unit: int = DAY_CANDLE_UNIT  # 분봉 단위(1440=일봉). 백테스트/검증/실거래가 같은 값을 쓴다.
 
 
 # ============================================================
@@ -145,7 +145,7 @@ def load_config():
         interval_seconds=_int_env("BOT_INTERVAL_SECONDS", 10),
         dry_run=_bool_env("BOT_DRY_RUN", True),
         log_level=os.getenv("BOT_LOG_LEVEL", "INFO"),
-        candle_unit=_candle_unit_env("BOT_CANDLE_UNIT", 15),
+        candle_unit=_candle_unit_env("BOT_CANDLE_UNIT", DAY_CANDLE_UNIT),
     )
 
     bt_cfg = BacktestConfig(

@@ -35,8 +35,11 @@ from bot.review_agent import ReviewAgent
 
 logger = get_logger(__name__)
 
-# 백테스트/검증에 사용할 캔들 수 (봉 단위는 BOT_CANDLE_UNIT, 기본 15분)
+# 백테스트/검증에 사용할 캔들 수 (봉 단위는 BOT_CANDLE_UNIT, 기본 1440=일봉)
 BACKTEST_CANDLES = 20_000
+
+# --strategy 없이 trade 모드를 실행할 때 쓰는 전략
+DEFAULT_TRADE_STRATEGY = "일봉 SMA50 추세"
 
 
 def load_market_data(client: UpbitClient, market: str,
@@ -203,7 +206,7 @@ def run_trade(strategy_name: str = "") -> None:
     선정된 전략으로 실거래 또는 모의거래를 실행합니다.
 
     Args:
-        strategy_name: 사용할 전략 이름 (비어있으면 첫 번째 전략 사용)
+        strategy_name: 사용할 전략 이름 (비어있으면 DEFAULT_TRADE_STRATEGY)
     """
     logger.info("=" * 50)
     logger.info("실거래 모드 시작")
@@ -218,16 +221,20 @@ def run_trade(strategy_name: str = "") -> None:
             logger.info(f"사용 가능한 전략: {available}")
             return
     else:
-        preferred_name = "AI 자율 매매"
-        strategy = get_strategy_by_name(preferred_name)
-        if strategy is None:
-            strategies = get_all_strategies()
-            strategy = strategies[0]
-            logger.info(
-                f"기본 선호 전략을 찾지 못해 첫 번째 전략을 사용합니다: {strategy.name}"
-            )
-        else:
-            logger.info(f"전략이 지정되지 않아 기본 선호 전략을 사용합니다: {strategy.name}")
+        # 비용을 넘는 엣지가 측정된 유일한 전략 (CLAUDE.md '일봉 추세 필터')
+        strategy = get_strategy_by_name(DEFAULT_TRADE_STRATEGY)
+        logger.info(f"전략이 지정되지 않아 기본 전략을 사용합니다: {strategy.name}")
+
+    # 전략이 검증된 봉 단위와 다르면 시작하지 않는다.
+    # 예: 일봉 추세 전략을 15분봉으로 돌리면 휩쏘와 비용으로 1분봉 측정 기준 −53%.
+    required = strategy.required_candle_unit
+    if required and required != BOT_CFG.candle_unit:
+        logger.error(
+            f"'{strategy.name}' 전략은 BOT_CANDLE_UNIT={required} 에서만 실행합니다 "
+            f"(현재 {BOT_CFG.candle_unit})."
+        )
+        logger.error(f".env 에 BOT_CANDLE_UNIT={required} 을 설정하세요.")
+        return
 
     if getattr(strategy, "ai_driven", False):
         if not os.getenv("OPENAI_API_KEY", "").strip():
