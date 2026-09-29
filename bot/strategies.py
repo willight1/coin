@@ -31,7 +31,7 @@ from .indicators import (
     calc_bollinger_bands, calc_volume_sma,
     is_high_breakout, calc_atr,
 )
-from .config import _float_env
+from .config import _float_env, DAY_CANDLE_UNIT
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -54,6 +54,9 @@ class BaseStrategy(ABC):
     # 이 전략에 맞는 리스크 설정 (RiskManager 인자). 백테스터/트레이더가
     # risk_manager 를 따로 받지 않으면 이 값으로 RiskManager 를 만든다.
     risk_overrides: dict = {}
+
+    # 이 전략이 검증된 봉 단위. 설정되어 있으면 실거래 모드는 다른 BOT_CANDLE_UNIT 에서 시작하지 않는다.
+    required_candle_unit: int | None = None
 
     @property
     @abstractmethod
@@ -830,6 +833,8 @@ class SmaTrendStrategy(BaseStrategy):
     일봉 종가가 SMA 위면 보유, 아래면 현금. 하락장 회피용 저빈도 추세 필터.
     측정 근거는 CLAUDE.md '일봉 추세 필터' 참고 (BOT_CANDLE_UNIT=1440 전제).
     """
+
+    required_candle_unit = DAY_CANDLE_UNIT
 
     # 추세 신호만으로 사고팔게 부가 규칙을 끈다. 트레일링/손절/순이익 게이트가
     # 켜져 있으면 추세 중간에 털려서 측정한 결과와 다른 전략이 된다.

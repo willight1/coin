@@ -9,8 +9,8 @@
 ```bash
 ./venv/bin/python main.py --mode backtest
 ./venv/bin/python main.py --mode validate
-./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"
-./venv/bin/python main.py --mode trade --strategy "1분 생존형 추세·눌림"
+./venv/bin/python main.py --mode trade                           # 기본: 일봉 SMA50 추세
+./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"   # 미검증
 ./venv/bin/python -m streamlit run dashboard.py
 ./venv/bin/python test_backtest_parity.py   # 백테스트 == 실거래 패리티 점검
 ```

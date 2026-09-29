@@ -30,9 +30,9 @@
 
 ## `AIAutonomousStrategy`는 검증된 적이 없다
 
-`main.py`의 기본 전략이지만 **백테스트가 불가능하다.** `generate_signals_series` 기본 구현이 봉마다 `generate_signal`을 부르는데 그게 매번 OpenAI API 호출이라, 20,000봉이면 20,000번 호출이다. 그래서 `get_all_strategies()`에 들어 있지 않고 `--mode backtest`/`validate` 결과에도 없다.
+예전엔 `main.py`의 기본 전략이었다(지금 기본은 `DEFAULT_TRADE_STRATEGY` = 일봉 SMA50 추세). **백테스트가 불가능하다.** `generate_signals_series` 기본 구현이 봉마다 `generate_signal`을 부르는데 그게 매번 OpenAI API 호출이라, 20,000봉이면 20,000번 호출이다. 그래서 `get_all_strategies()`에 들어 있지 않고 `--mode backtest`/`validate` 결과에도 없다.
 
-실거래에 쓰기 전에 먼저 백테스트 가능하게 만들어야 한다. 그 전까지는 "검증 안 된 전략이 기본값"인 상태다.
+실거래에 쓰기 전에 먼저 백테스트 가능하게 만들어야 한다.
 
 LLM 관련 모듈 3개의 실제 역할(코드가 이름만으로는 오해를 부른다):
 - `ai_strategy.py` — 봉마다 BUY/SELL/HOLD **한 글자**만 결정. 전략을 바꾸거나 리스크 파라미터를 조정하지 않는다. 과거 거래 기억 없음
@@ -99,7 +99,7 @@ LLM 관련 모듈 3개의 실제 역할(코드가 이름만으로는 오해를 �
 
 - **DRY_RUN 가상 잔고는 `state/dry_run_<마켓>.json`에 저장된다**(gitignore 대상). 재시작해도 이어지며, 초기 금액을 바꾸거나 처음부터 다시 하려면 이 파일을 지운다. 실거래는 파일 없이 업비트 계좌에서 보유분을 동기화한다.
 - **`.env`가 없으면 `bot/config.py`의 기본값이 진실이다.** `.env.example`은 거기에 맞춰 동기화해 둔 것이니, 기본값을 바꾸면 양쪽을 같이 고친다.
-- **`BOT_CANDLE_UNIT`(기본 15)이 봉 단위를 한 곳에서 결정한다.** 백테스트·검증·실거래·대시보드가 모두 이 값을 쓴다. 어디에도 `unit=1` / `candle_unit=1`을 다시 하드코딩하지 말 것.
+- **`BOT_CANDLE_UNIT`(기본 1440=일봉)이 봉 단위를 한 곳에서 결정한다.** 전략에 `required_candle_unit`이 있으면 실거래 모드는 값이 다를 때 시작을 거부한다(백테스트/검증은 실험용으로 허용). 백테스트·검증·실거래·대시보드가 모두 이 값을 쓴다. 어디에도 `unit=1` / `candle_unit=1`을 다시 하드코딩하지 말 것.
 - `RiskManager(**overrides)`는 **0을 유효한 값으로 받는다**(손절 비활성 등). 예전의 `x or DEFAULT` 패턴은 0을 넘기면 설정값으로 되돌아가는 버그였다.
 
 ## 실행
@@ -107,8 +107,7 @@ LLM 관련 모듈 3개의 실제 역할(코드가 이름만으로는 오해를 �
 ```bash
 ./venv/bin/python main.py --mode backtest    # 전략별 백테스트
 ./venv/bin/python main.py --mode validate    # IS/OOS 분리 검증
-./venv/bin/python main.py --mode trade --strategy "1분 생존형 추세·눌림"
-BOT_CANDLE_UNIT=1440 ./venv/bin/python main.py --mode validate   # 일봉 SMA 추세
+./venv/bin/python main.py --mode trade        # 기본: 일봉 SMA50 추세 (BOT_CANDLE_UNIT=1440)
 ./venv/bin/python -m streamlit run dashboard.py
 ```
 

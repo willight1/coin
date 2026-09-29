@@ -12,8 +12,8 @@ cp .env.example .env
 ```bash
 ./venv/bin/python main.py --mode backtest
 ./venv/bin/python main.py --mode validate
-./venv/bin/python main.py --mode trade
-./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"
+./venv/bin/python main.py --mode trade                           # 기본: 일봉 SMA50 추세
+./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"   # 미검증
 ./venv/bin/python main.py --mode review
 ./venv/bin/python main.py --mode review --date 2026-03-28
 ./venv/bin/python -m streamlit run dashboard.py
@@ -120,6 +120,6 @@ AI_TRADER_FAIL_SIGNAL=HOLD
 ## 5) 권장 순서
 1. `./venv/bin/python main.py --mode backtest`
 2. `./venv/bin/python main.py --mode validate`
-3. `./venv/bin/python main.py --mode trade --strategy "1분 생존형 추세·눌림"` (`BOT_DRY_RUN=true`)
+3. `./venv/bin/python main.py --mode trade` (`BOT_DRY_RUN=true`, 기본 전략 일봉 SMA50 추세)
 4. 종료는 `Ctrl+C` (END 스냅샷 기록)
 5. `./venv/bin/python main.py --mode review --date $(date +%F)`

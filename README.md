@@ -1,9 +1,11 @@
-# 업비트 AI 자율 자동매매 시스템
+# 업비트 현물 자동매매 시스템
 
-AI가 최근 캔들/지표를 직접 해석해 매수·매도·관망을 판단하고, 리스크 규칙으로 안전장치를 거는 업비트 현물 트레이딩 프로젝트입니다.
+업비트 현물 트레이딩 프로젝트입니다. 백테스트와 실거래가 같은 리스크 규칙·체결 모델을 씁니다.
 
 ## 핵심 원칙
-- 실주문 판단은 `AI 자율 매매` 전략의 `BUY/SELL/HOLD` 신호를 기본으로 사용
+- 기본 전략은 `일봉 SMA50 추세` (`BOT_CANDLE_UNIT=1440`). 비용을 넘는 엣지가 측정된 유일한 전략이다 — 근거와 한계는 `CLAUDE.md`
+- 전략이 검증된 봉 단위와 `BOT_CANDLE_UNIT`이 다르면 실거래 모드는 시작하지 않는다
+- `AI 자율 매매`는 백테스트가 불가능해 검증된 적이 없다 (선택 사항)
 - 손절/트레일링/순이익 기준 등 리스크 규칙은 항상 우선
 - 규칙 기반 전략도 병행 사용 가능
 
@@ -51,8 +53,8 @@ cp .env.example .env
 ```bash
 ./venv/bin/python main.py --mode backtest
 ./venv/bin/python main.py --mode validate
-./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"
-./venv/bin/python main.py --mode trade --strategy "1분 생존형 추세·눌림"
+./venv/bin/python main.py --mode trade                           # 기본: 일봉 SMA50 추세
+./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"   # 미검증
 ./venv/bin/python main.py --mode review --date 2026-03-28
 ./venv/bin/python -m streamlit run dashboard.py
 ```
