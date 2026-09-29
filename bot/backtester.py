@@ -7,7 +7,8 @@ backtester.py — 자체 백테스트 엔진
 주요 기능:
 - 초기 자본 기반 매수/매도/보유 시뮬레이션
 - 수수료, 슬리피지 반영
-- 손절/트레일링 스탑 자동 처리
+- 손절/익절/트레일링 스탑은 RiskManager 를 그대로 호출 (실거래와 동일 코드)
+- 실거래와 동일한 체결 모델: 직전 확정봉 신호 -> 다음 봉 시가 체결
 - 포지션 상태 관리
 - 거래 로그 저장 (CSV)
 - 전략별 성과 지표 계산 (수익률, MDD, 승률, 샤프 등)
@@ -28,8 +29,11 @@ import pandas as pd
 import numpy as np
 
 from .config import BT_CFG, RISK_CFG
+from .indicators import calc_atr
 from .logger import get_logger
 from .paths import PROJECT_ROOT
+from .risk_manager import RiskManager, MIN_ORDER_KRW
+from .strategies import BUY, SELL, HOLD
 
 logger = get_logger(__name__)
 
@@ -80,28 +84,39 @@ class Backtester:
         initial_capital: 초기 자본 (KRW)
         fee_rate: 수수료율
         slippage_rate: 슬리피지율
-        stop_loss_pct: 손절 퍼센트
-        trailing_stop_pct: 트레일링 스탑 퍼센트
+        candle_seconds: 봉 하나의 길이(초) — 쿨다운 판정에 사용
     """
 
-    def __init__(self, initial_capital: float = 0, fee_rate: float = 0,
-                 slippage_rate: float = 0, stop_loss_pct: float = 0,
-                 trailing_stop_pct: float = 0):
-        self.initial_capital = initial_capital or BT_CFG.initial_capital
-        self.fee_rate = fee_rate or BT_CFG.fee_rate
-        self.slippage_rate = slippage_rate or BT_CFG.slippage_rate
-        self.stop_loss_pct = stop_loss_pct or RISK_CFG.stop_loss_pct
-        self.trailing_stop_pct = trailing_stop_pct or RISK_CFG.trailing_stop_pct
-        self.min_net_profit_pct = RISK_CFG.min_net_profit_pct
+    def __init__(self, initial_capital: float | None = None,
+                 fee_rate: float | None = None,
+                 slippage_rate: float | None = None,
+                 candle_seconds: int = 60):
+        # 0 도 유효한 값(비용 0 진단 등) — `x or 기본값` 은 0 을 기본값으로 되돌린다
+        def _pick(v, default):
+            return default if v is None else v
+        self.initial_capital = _pick(initial_capital, BT_CFG.initial_capital)
+        self.fee_rate = _pick(fee_rate, BT_CFG.fee_rate)
+        self.slippage_rate = _pick(slippage_rate, BT_CFG.slippage_rate)
+        self.candle_seconds = candle_seconds
+        # 실거래(trader.py)와 동일한 왕복 비용 추정치
+        self.roundtrip_cost_pct = (self.fee_rate + self.slippage_rate) * 2 * 100
 
-    def run(self, strategy, df: pd.DataFrame) -> BacktestResult:
+    def run(self, strategy, df: pd.DataFrame,
+            risk_manager: RiskManager | None = None) -> BacktestResult:
         """
         전략을 백테스트합니다.
+
+        실거래(trader.py)와 동일한 의사결정 경로를 사용합니다:
+        - 신호는 직전 확정봉 기준 (signals.shift(1)), 매수·추세매도 모두 다음 봉 시가 체결
+        - 체결은 다음 봉 시가 + 슬리피지, 수수료는 금액에서 차감
+        - 손절/익절/추세매도/트레일링 판단은 RiskManager 를 그대로 호출
+        - 매수 금액, 쿨다운, 최대 포지션 수, 추격매수 제한, 최소주문금액 모두 적용
 
         Args:
             strategy: BaseStrategy 인스턴스
             df: OHLCV 데이터프레임 (시간 오름차순)
                 필수 컬럼: open, high, low, close, volume
+            risk_manager: 리스크 설정을 바꿔 실험할 때 주입 (기본: .env 설정)
 
         Returns:
             BacktestResult: 백테스트 결과
@@ -112,160 +127,148 @@ class Backtester:
         logger.info(f"  수수료: {self.fee_rate * 100:.3f}%, "
                      f"슬리피지: {self.slippage_rate * 100:.3f}%")
 
-        # ---- 초기 상태 ----
-        cash = self.initial_capital       # 현금 보유량
-        position = 0.0                     # 보유 수량
-        entry_price = 0.0                  # 매수 가격
-        peak_price = 0.0                   # 보유 중 최고가 (트레일링 스탑용)
-        trade_log = []                     # 거래 기록
-        equity_curve = []                  # 자산 추이
-        trade_returns = []                 # 각 거래 수익률
+        market = "BACKTEST"
+        rm = risk_manager or RiskManager(**strategy.risk_overrides)
+        rm.reset()
 
-        # ---- 전략 신호 생성 (벡터 연산) ----
-        signals = strategy.generate_signals_series(df)
+        cash = self.initial_capital   # 현금 보유량
+        position = 0.0                # 보유 수량
+        position_cost = 0.0           # 보유분 총 투입금액 (수수료 포함)
+        trade_log = []
+        equity_curve = []
+        trade_returns = []
+
+        # ---- 신호: 직전 확정봉 기준 (실거래와 동일하게 한 봉 지연) ----
+        signals = strategy.generate_signals_series(df).shift(1).fillna(HOLD)
+        signal_prices = df["close"].shift(1)
+
+        # ---- 변동성: 실거래는 직전 확정봉까지의 ATR 과 그 평균을 쓴다 ----
+        atr_series = calc_atr(df["high"], df["low"], df["close"], 14).shift(1)
+        avg_atr_series = atr_series.rolling(window=200, min_periods=30).mean()
+
+        opens = df["open"].to_numpy(dtype=float)
+        highs = df["high"].to_numpy(dtype=float)
+        lows = df["low"].to_numpy(dtype=float)
+        closes = df["close"].to_numpy(dtype=float)
+        atrs = atr_series.to_numpy(dtype=float)
+        avg_atrs = avg_atr_series.to_numpy(dtype=float)
+
+        def _nz(v: float) -> float:
+            return 0.0 if (v is None or np.isnan(v)) else float(v)
+
+        def _close_position(exit_price: float, action: str, timestamp,
+                            now: float) -> None:
+            """보유분 전량을 청산하고 거래를 기록합니다."""
+            nonlocal cash, position, position_cost
+            proceeds = position * exit_price * (1 - self.fee_rate)
+            pnl_pct = ((proceeds / position_cost - 1) * 100
+                       if position_cost > 0 else 0.0)
+            trade_log.append({
+                "timestamp": timestamp,
+                "action": action,
+                "price": exit_price,
+                "volume": position,
+                "pnl_pct": pnl_pct,
+                "cash_after": cash + proceeds,
+            })
+            trade_returns.append(pnl_pct)
+            cash += proceeds
+            position = 0.0
+            position_cost = 0.0
+            rm.record_sell(market, now=now)
 
         # ---- 봉별 시뮬레이션 ----
         for i in range(len(df)):
-            row = df.iloc[i]
-            current_price = row["close"]
             signal = signals.iloc[i]
+            bar_open, bar_high, bar_low, bar_close = (
+                opens[i], highs[i], lows[i], closes[i]
+            )
+            now = i * self.candle_seconds
+            timestamp = (df["candle_date_time_kst"].iloc[i]
+                         if "candle_date_time_kst" in df.columns
+                         else str(df.index[i]))
 
-            # 타임스탬프 (있으면 사용, 없으면 인덱스)
-            timestamp = (row.get("candle_date_time_kst")
-                         or row.get("candle_date_time_utc")
-                         or str(df.index[i]))
+            # ---- 보유 중: 손절 / 익절 / 추세매도 / 트레일링 ----
+            if position > 0:
+                entry_price = rm.state.entry_prices.get(market, 0.0)
+                # 고점은 봉 고가로 갱신 (트레일링 판단 기준)
+                rm.update_peak_price(market, bar_high)
+                peak_price = rm.state.peak_prices.get(market, 0.0)
 
-            # -- 포지션 보유 중 손절/추세이탈/트레일링스탑 체크 --
-            if position > 0 and entry_price > 0:
-                peak_price = max(peak_price, current_price)
-                price_change_pct = (current_price - entry_price) / entry_price
+                # 추세매도: 직전 확정봉 SELL 신호 -> 이번 봉 시가 체결 (매수와 같은 체결 모델).
+                # 트레이더는 새 봉이 열리자마자 현재가로 팔므로 봉 안의 손절/트레일링보다 먼저다.
+                if (signal == SELL
+                        and rm.check_min_net_profit_exit(
+                            market, bar_open, self.roundtrip_cost_pct)[0]
+                        and rm.check_sell(signal, market, bar_open)[0]):
+                    _close_position(bar_open * (1 - self.slippage_rate),
+                                    "TREND_EXIT", timestamp, now)
 
-                # 손절 조건
-                if price_change_pct <= -self.stop_loss_pct:
-                    sell_price = current_price * (1 - self.slippage_rate)
-                    proceeds = position * sell_price * (1 - self.fee_rate)
-                    pnl_pct = (sell_price / entry_price - 1) * 100
+                # 손절: 봉 저가가 손절선을 건드리면 손절선에서 체결
+                elif rm.check_stop_loss(market, bar_low)[0]:
+                    level = entry_price * (1 - rm.stop_loss_pct)
+                    _close_position(level * (1 - self.slippage_rate),
+                                    "STOP_LOSS", timestamp, now)
 
-                    trade_log.append({
-                        "timestamp": timestamp,
-                        "action": "STOP_LOSS",
-                        "price": sell_price,
-                        "volume": position,
-                        "pnl_pct": pnl_pct,
-                        "cash_after": cash + proceeds,
-                    })
-                    trade_returns.append(pnl_pct)
-                    cash += proceeds
-                    position = 0.0
-                    entry_price = 0.0
-                    peak_price = 0.0
+                # 익절은 종가 기준으로 판단
+                elif rm.check_take_profit_net(
+                        market, bar_close, self.roundtrip_cost_pct)[0]:
+                    _close_position(bar_close * (1 - self.slippage_rate),
+                                    "TAKE_PROFIT", timestamp, now)
 
-                # 추세 이탈(전략 SELL) 조건
-                elif signal == "SELL":
-                    sell_price = current_price * (1 - self.slippage_rate)
-                    proceeds = position * sell_price * (1 - self.fee_rate)
-                    pnl_pct = (sell_price / entry_price - 1) * 100
-                    if pnl_pct < self.min_net_profit_pct:
-                        # 수수료/슬리피지 후 순이익 기준 미달이면 추세매도 보류
-                        pass
-                    else:
-                        trade_log.append({
-                            "timestamp": timestamp,
-                            "action": "TREND_EXIT",
-                            "price": sell_price,
-                            "volume": position,
-                            "pnl_pct": pnl_pct,
-                            "cash_after": cash + proceeds,
-                        })
-                        trade_returns.append(pnl_pct)
-                        cash += proceeds
-                        position = 0.0
-                        entry_price = 0.0
-                        peak_price = 0.0
+                # 트레일링: 봉 저가가 되돌림 기준을 건드리면 그 선에서 체결
+                elif rm.check_trailing_stop(market, bar_low)[0]:
+                    level = peak_price * (1 - rm.trailing_stop_pct)
+                    _close_position(level * (1 - self.slippage_rate),
+                                    "TRAILING_STOP", timestamp, now)
 
-                # 트레일링 스탑 조건
-                elif (self.trailing_stop_pct > 0 and peak_price > entry_price):
-                    pullback_pct = (peak_price - current_price) / peak_price
-                    if pullback_pct >= self.trailing_stop_pct:
-                        sell_price = current_price * (1 - self.slippage_rate)
-                        proceeds = position * sell_price * (1 - self.fee_rate)
-                        pnl_pct = (sell_price / entry_price - 1) * 100
-
-                        trade_log.append({
-                            "timestamp": timestamp,
-                            "action": "TRAILING_STOP",
-                            "price": sell_price,
-                            "volume": position,
-                            "pnl_pct": pnl_pct,
-                            "cash_after": cash + proceeds,
-                        })
-                        trade_returns.append(pnl_pct)
-                        cash += proceeds
-                        position = 0.0
-                        entry_price = 0.0
-                        peak_price = 0.0
-
-            # -- 매수 신호 처리 --
-            if signal == "BUY" and position == 0 and cash > 0:
-                buy_price = current_price * (1 + self.slippage_rate)
-                buy_amount = cash * (1 - self.fee_rate)  # 수수료 제외 금액
-                volume = buy_amount / buy_price
-
-                trade_log.append({
-                    "timestamp": timestamp,
-                    "action": "BUY",
-                    "price": buy_price,
-                    "volume": volume,
-                    "pnl_pct": 0,
-                    "cash_after": 0,
-                })
-
-                position = volume
-                entry_price = buy_price
-                peak_price = buy_price
-                cash = 0.0
-
-            # -- 매도 신호 처리 --
-            elif signal == "SELL" and position > 0:
-                sell_price = current_price * (1 - self.slippage_rate)
-                proceeds = position * sell_price * (1 - self.fee_rate)
-                pnl_pct = (sell_price / entry_price - 1) * 100
-                if pnl_pct < self.min_net_profit_pct:
-                    # 최소 순이익 기준 미달이면 보류
+            # ---- 매수 신호 처리 ----
+            if signal == BUY:
+                allowed, reason = rm.check_buy(
+                    signal, cash, bar_open,
+                    atr=_nz(atrs[i]), avg_atr=_nz(avg_atrs[i]), now=now,
+                )
+                if not allowed:
                     pass
                 else:
-                    trade_log.append({
-                        "timestamp": timestamp,
-                        "action": "SELL",
-                        "price": sell_price,
-                        "volume": position,
-                        "pnl_pct": pnl_pct,
-                        "cash_after": proceeds,
-                    })
-                    trade_returns.append(pnl_pct)
-                    cash = proceeds
-                    position = 0.0
-                    entry_price = 0.0
-                    peak_price = 0.0
+                    buy_price = bar_open * (1 + self.slippage_rate)
+                    chase_ok, _ = rm.check_chase(signal_prices.iloc[i], bar_open)
+                    if not chase_ok:
+                        pass
+                    else:
+                        amount = rm.get_buy_amount(cash)
+                        if reason.startswith("고변동 경고"):
+                            amount *= rm.high_vol_buy_scale
 
-            # -- 자산 추이 기록 --
-            equity = cash + (position * current_price if position > 0 else 0)
+                        if amount >= MIN_ORDER_KRW and amount <= cash:
+                            volume = amount * (1 - self.fee_rate) / buy_price
+                            trade_log.append({
+                                "timestamp": timestamp,
+                                "action": "BUY",
+                                "price": buy_price,
+                                "volume": volume,
+                                "pnl_pct": 0,
+                                "cash_after": cash - amount,
+                            })
+                            cash -= amount
+                            position += volume
+                            position_cost += amount
+                            rm.record_buy(market, buy_price, now=now)
+
+            # ---- 자산 추이 기록 ----
             equity_curve.append({
                 "timestamp": timestamp,
-                "equity": equity,
+                "equity": cash + position * bar_close,
                 "cash": cash,
-                "position_value": position * current_price if position > 0 else 0,
+                "position_value": position * bar_close,
             })
 
         # ---- 마지막 미청산 포지션 정리 ----
         if position > 0:
-            last_price = df["close"].iloc[-1] * (1 - self.slippage_rate)
-            proceeds = position * last_price * (1 - self.fee_rate)
-            pnl_pct = (last_price / entry_price - 1) * 100
-            trade_returns.append(pnl_pct)
-            cash += proceeds
-            position = 0.0
-            peak_price = 0.0
+            last_price = float(closes[-1]) * (1 - self.slippage_rate)
+            _close_position(last_price, "FINAL_EXIT",
+                            equity_curve[-1]["timestamp"],
+                            (len(df) - 1) * self.candle_seconds)
 
         # ---- 성과 지표 계산 ----
         result = self._calc_metrics(
@@ -303,8 +306,10 @@ class Backtester:
             (final_capital - self.initial_capital) / self.initial_capital * 100
         )
 
-        # 기간 추정 (분봉 → 일수 환산, 대략적)
-        result.period_days = max(num_candles // (24 * 60), 1)
+        # 기간 추정 (봉 길이 기준 일수 환산)
+        result.period_days = max(
+            int(num_candles * self.candle_seconds // 86_400), 1
+        )
 
         # CAGR (연환산 수익률)
         years = result.period_days / 365.0

@@ -15,6 +15,7 @@ trader.py — 실거래 엔진
     trader.run()  # 무한 루프 (Ctrl+C로 종료)
 """
 
+import json
 import os
 import time
 import traceback
@@ -24,14 +25,14 @@ import pandas as pd
 
 from .config import UPBIT_CFG, BOT_CFG, RISK_CFG, BT_CFG
 from .logger import get_logger
+from .paths import PROJECT_ROOT
 from .upbit_client import UpbitClient, UpbitClientError
-from .risk_manager import RiskManager
+from .risk_manager import RiskManager, MIN_ORDER_KRW
 from .strategies import BaseStrategy, BUY, SELL, HOLD
 from .indicators import calc_atr
 from .llm_gate import LLMGate
 
 logger = get_logger(__name__)
-MIN_ORDER_KRW = 5000.0
 DEFAULT_DRY_RUN_KRW = 1_000_000.0
 
 
@@ -57,16 +58,14 @@ class Trader:
                  market: str = "",
                  interval: int = 0,
                  candle_unit: int = 1,
-                 candle_count: int = 200,
-                 max_chase_pct: float = 0):
+                 candle_count: int = 200):
         self.strategy = strategy
         self.client = client or UpbitClient(dry_run=BOT_CFG.dry_run)
-        self.risk_manager = risk_manager or RiskManager()
+        self.risk_manager = risk_manager or RiskManager(**strategy.risk_overrides)
         self.market = market or UPBIT_CFG.market
         self.interval = interval or BOT_CFG.interval_seconds
         self.candle_unit = candle_unit
         self.candle_count = candle_count
-        self.max_chase_pct = max_chase_pct or RISK_CFG.max_chase_pct
         self.last_signal_order_candle = ""
         self.last_snapshot_candle = ""
         self.last_notified_signal = ""
@@ -86,6 +85,10 @@ class Trader:
         )
         self.virtual_coin_balance = 0.0
         self.virtual_avg_buy_price = 0.0
+        # DRY_RUN 가상 잔고 저장 파일. 재시작해도 이어서 검증할 수 있게 한다.
+        # 처음부터 다시 하려면 파일을 지운다. None 이면 저장하지 않는다(테스트용).
+        self.state_path = os.path.join(
+            PROJECT_ROOT, "state", f"dry_run_{self.market}.json")
 
         # 거래 대상 화폐 코드 (예: "BTC")
         self.currency = self.market.split("-")[1] if "-" in self.market else ""
@@ -93,8 +96,8 @@ class Trader:
         logger.info(f"트레이더 초기화: 전략={strategy.name}, "
                      f"마켓={self.market}, 주기={self.interval}초")
         logger.info(f"  DRY_RUN: {self.client.dry_run}")
-        logger.info(f"  추격매수 제한: {self.max_chase_pct * 100:.2f}%")
-        logger.info(f"  최소 순이익 매도 기준: {RISK_CFG.min_net_profit_pct:.3f}%")
+        logger.info(f"  추격매수 제한: {self.risk_manager.max_chase_pct * 100:.2f}%")
+        logger.info(f"  최소 순이익 매도 기준: {self.risk_manager.min_net_profit_pct:.3f}%")
         logger.info(f"  LLM 게이트 사용: {self.llm_gate.enabled}")
         logger.info(f"  신호변경 로그 모드: {self.log_signal_change_only}")
         if self.client.dry_run:
@@ -159,6 +162,46 @@ class Trader:
             logger.error(f"[{self.market}] 예상치 못한 오류: {e}")
             logger.error(traceback.format_exc())
 
+    def _load_dry_run_state(self) -> None:
+        """저장된 DRY_RUN 가상 잔고/포지션을 복원합니다 (실거래의 계좌 동기화에 해당)."""
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        with open(self.state_path, encoding="utf-8") as f:
+            s = json.load(f)
+        self.virtual_krw_balance = float(s["krw"])
+        self.virtual_coin_balance = float(s["coin"])
+        self.virtual_avg_buy_price = float(s["avg_buy_price"])
+        if self.virtual_coin_balance > 0:
+            entry = float(s.get("entry_price") or self.virtual_avg_buy_price)
+            self.risk_manager.state.entry_prices[self.market] = entry
+            self.risk_manager.state.peak_prices[self.market] = float(
+                s.get("peak_price") or entry)
+            self.risk_manager.state.current_positions = max(
+                self.risk_manager.state.current_positions, 1)
+        logger.info(
+            f"[DRY_RUN] 저장된 가상 잔고 복원 ({self.state_path}): "
+            f"krw={self.virtual_krw_balance:,.0f}, "
+            f"coin={self.virtual_coin_balance:.8f}, "
+            f"avg_buy={self.virtual_avg_buy_price:,.0f}"
+        )
+
+    def _save_dry_run_state(self) -> None:
+        """DRY_RUN 가상 잔고를 저장합니다. 임시 파일에 쓴 뒤 교체해 중간에 죽어도 깨지지 않게 한다."""
+        if not self.state_path:
+            return
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({
+                "krw": self.virtual_krw_balance,
+                "coin": self.virtual_coin_balance,
+                "avg_buy_price": self.virtual_avg_buy_price,
+                "entry_price": self.risk_manager.state.entry_prices.get(self.market, 0.0),
+                "peak_price": self.risk_manager.state.peak_prices.get(self.market, 0.0),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.state_path)
+
     def _sync_existing_position(self) -> None:
         """
         시작 시 기존 보유 포지션을 리스크 상태에 1회 동기화합니다.
@@ -168,6 +211,7 @@ class Trader:
             return
 
         if self.client.dry_run:
+            self._load_dry_run_state()
             self.state_synced = True
             return
 
@@ -323,6 +367,9 @@ class Trader:
 
         # ---- 3. 손절/추세이탈/트레일링스탑 확인 ----
         if self.risk_manager.state.current_positions > 0:
+            # 고점은 매 틱 갱신한다. 추세매도가 보류되더라도 트레일링 기준은 살아 있어야 한다.
+            self.risk_manager.update_peak_price(self.market, current_price)
+
             stop, stop_reason = self.risk_manager.check_stop_loss(
                 self.market, current_price)
             if stop:
@@ -340,11 +387,9 @@ class Trader:
                 self._execute_sell(current_price, reason="TAKE_PROFIT")
                 return
 
-            # 추세선(전략) 이탈은 트레일링 스탑보다 우선
+            # 추세선(전략) 이탈은 트레일링 스탑보다 우선.
+            # 단, 추세매도가 보류되면 아래 트레일링 스탑 판정으로 내려간다.
             if effective_signal == SELL:
-                if self._is_duplicate_signal_order(signal_candle):
-                    logger.info("  매도 차단: 같은 확정봉에서 중복 신호 주문 방지")
-                    return
                 min_profit_ok, min_profit_reason = (
                     self.risk_manager.check_min_net_profit_exit(
                         self.market,
@@ -352,23 +397,29 @@ class Trader:
                         estimated_cost_pct=self.estimated_roundtrip_cost_pct,
                     )
                 )
-                if not min_profit_ok:
-                    logger.info(f"  매도 보류: {min_profit_reason}")
-                    return
                 allowed, reason = self.risk_manager.check_sell(
                     effective_signal, self.market, current_price)
-                if allowed:
+
+                if self._is_duplicate_signal_order(signal_candle):
+                    logger.info("  매도 보류: 같은 확정봉에서 중복 신호 주문 방지")
+                elif not min_profit_ok:
+                    logger.info(f"  매도 보류: {min_profit_reason}")
+                elif not allowed:
+                    logger.info(f"  매도 차단: {reason}")
+                else:
                     if self._execute_sell(current_price, reason="TREND_EXIT"):
                         self.last_signal_order_candle = signal_candle
-                else:
-                    logger.info(f"  매도 차단: {reason}")
-                return
+                    return
 
             trailing, trailing_reason = self.risk_manager.check_trailing_stop(
                 self.market, current_price)
             if trailing:
                 logger.info(f"  {trailing_reason}")
                 self._execute_sell(current_price, reason="TRAILING_STOP")
+                return
+
+            # 보유 중에는 신규 매수/매도 신호 처리로 내려가지 않는다.
+            if effective_signal == SELL:
                 return
 
         # ---- 4. 매수 처리 ----
@@ -407,15 +458,11 @@ class Trader:
                     logger.info("  매수 차단: 같은 확정봉에서 중복 신호 주문 방지")
                     return
 
-                if signal_price > 0:
-                    chase_pct = (current_price - signal_price) / signal_price
-                    if chase_pct > self.max_chase_pct:
-                        logger.info(
-                            "  매수 차단: 추격매수 제한 초과 "
-                            f"(현재 {chase_pct * 100:.2f}% > "
-                            f"허용 {self.max_chase_pct * 100:.2f}%)"
-                        )
-                        return
+                chase_ok, chase_reason = self.risk_manager.check_chase(
+                    signal_price, current_price)
+                if not chase_ok:
+                    logger.info(f"  매수 차단: {chase_reason}")
+                    return
 
                 buy_amount = self.risk_manager.get_buy_amount(krw_balance)
                 if buy_amount > 0:
@@ -530,7 +577,11 @@ class Trader:
                         f"({self.virtual_krw_balance:,.0f} < {amount:,.0f})"
                     )
                     return False
-                filled_volume = amount / current_price if current_price > 0 else 0.0
+                fill_price = current_price * (1 + BT_CFG.slippage_rate)
+                filled_volume = (
+                    amount * (1 - BT_CFG.fee_rate) / fill_price
+                    if fill_price > 0 else 0.0
+                )
                 prev_cost = self.virtual_avg_buy_price * self.virtual_coin_balance
                 new_cost = prev_cost + amount
                 new_volume = self.virtual_coin_balance + filled_volume
@@ -546,14 +597,16 @@ class Trader:
                     "filled_volume": filled_volume,
                 }
                 logger.info(f"  >> 주문 결과: {result}")
-                self.risk_manager.record_buy(self.market, current_price)
+                self.risk_manager.record_buy(self.market, fill_price)
+                self._save_dry_run_state()
                 self._log_trade_balance_snapshot("BUY", "AFTER", current_price=current_price)
                 return True
 
             result = self.client.order_market_buy(
                 market=self.market, price=amount)
             logger.info(f"  >> 주문 결과: {result}")
-            self.risk_manager.record_buy(self.market, current_price)
+            self.risk_manager.record_buy(
+                self.market, current_price * (1 + BT_CFG.slippage_rate))
             self._log_trade_balance_snapshot("BUY", "AFTER", current_price=current_price)
             return True
         except Exception as e:
@@ -586,7 +639,10 @@ class Trader:
                 return False
 
             if self.client.dry_run:
-                proceeds = volume * current_price
+                proceeds = (
+                    volume * current_price
+                    * (1 - BT_CFG.slippage_rate) * (1 - BT_CFG.fee_rate)
+                )
                 cost_basis = volume * entry_price if entry_price > 0 else 0.0
                 pnl_krw = proceeds - cost_basis
                 pnl_pct = (pnl_krw / cost_basis * 100) if cost_basis > 0 else 0.0
@@ -608,6 +664,7 @@ class Trader:
                     f"추정순이익률={est_net_pct:.2f}%"
                 )
                 self.risk_manager.record_sell(self.market)
+                self._save_dry_run_state()
                 self._log_trade_balance_snapshot("SELL", "AFTER", current_price=current_price)
                 return True
 

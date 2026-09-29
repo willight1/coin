@@ -22,7 +22,6 @@ import time
 from datetime import datetime
 
 import pandas as pd
-import numpy as np
 
 from bot.config import UPBIT_CFG, BOT_CFG, BT_CFG, RISK_CFG
 from bot.logger import get_logger
@@ -36,50 +35,8 @@ from bot.review_agent import ReviewAgent
 
 logger = get_logger(__name__)
 
-
-# ============================================================
-# 샘플 데이터 생성 (API 키 없을 때 백테스트용)
-# ============================================================
-def generate_sample_data(num_candles: int = 2000,
-                         start_price: float = 50_000_000) -> pd.DataFrame:
-    """
-    API 키가 없을 때 백테스트 용도로 랜덤 캔들 데이터를 생성합니다.
-    실제 시장 데이터를 대체하는 용도이며, 랜덤 워크 기반입니다.
-
-    Args:
-        num_candles: 생성할 캔들 수
-        start_price: 시작 가격
-
-    Returns:
-        pd.DataFrame: OHLCV 데이터프레임
-    """
-    np.random.seed(42)  # 재현성을 위한 고정 시드
-
-    prices = [start_price]
-    for _ in range(num_candles - 1):
-        # 랜덤 워크: ±2% 변동
-        change = np.random.normal(0, 0.01)
-        new_price = prices[-1] * (1 + change)
-        prices.append(max(new_price, 1000))  # 최소 가격 보장
-
-    data = []
-    for i, price in enumerate(prices):
-        # 랜덤 OHLC 생성
-        high = price * (1 + abs(np.random.normal(0, 0.005)))
-        low = price * (1 - abs(np.random.normal(0, 0.005)))
-        open_price = price * (1 + np.random.normal(0, 0.003))
-        volume = abs(np.random.normal(100, 30))
-
-        data.append({
-            "open": open_price,
-            "high": max(high, open_price, price),
-            "low": min(low, open_price, price),
-            "close": price,
-            "volume": volume,
-            "candle_date_time_kst": f"2024-01-01T00:{i:04d}:00",
-        })
-
-    return pd.DataFrame(data)
+# 백테스트/검증에 사용할 캔들 수 (봉 단위는 BOT_CANDLE_UNIT, 기본 15분)
+BACKTEST_CANDLES = 20_000
 
 
 def load_market_data(client: UpbitClient, market: str,
@@ -87,74 +44,69 @@ def load_market_data(client: UpbitClient, market: str,
     """
     업비트 API에서 시세 데이터를 조회합니다.
     200개 제한을 우회하기 위해 여러 번 요청하여 합칩니다.
-    API 키가 없거나 실패하면 샘플 데이터를 반환합니다.
+    조회 실패는 예외로 올린다 — 가짜 데이터로 검증하면 결과가 무의미해진다.
 
     Args:
         client: 업비트 API 클라이언트
         market: 마켓 코드
         count: 목표 캔들 수 (200 초과 시 페이지네이션)
-        unit: 분봉 단위 (1, 3, 5, 15, 30, 60, 240)
+        unit: 분봉 단위 (1, 3, 5, 15, 30, 60, 240, 1440=일봉)
 
     Returns:
         pd.DataFrame: OHLCV 데이터프레임
     """
-    try:
-        logger.info(f"업비트 API에서 {unit}분봉 데이터 조회: {market}, 목표 {count}개")
-        all_candles = []
-        remaining = count
-        to_param = None  # 페이지네이션용 시각 파라미터
+    logger.info(f"업비트 API에서 {unit}분봉 데이터 조회: {market}, 목표 {count}개")
+    all_candles = []
+    remaining = count
+    to_param = None  # 페이지네이션용 시각 파라미터
 
-        while remaining > 0:
-            batch_size = min(remaining, 200)
-            params = {"market": market, "count": batch_size}
-            if to_param:
-                params["to"] = to_param
+    while remaining > 0:
+        batch_size = min(remaining, 200)
+        params = {"market": market, "count": batch_size}
+        if to_param:
+            params["to"] = to_param
 
-            candles = client._request(
-                "GET", f"/v1/candles/minutes/{unit}", params=params
-            )
+        candles = client._request(
+            "GET", client.candles_endpoint(unit), params=params
+        )
 
-            if not candles:
-                break
+        if not candles:
+            break
 
-            all_candles.extend(candles)
-            remaining -= len(candles)
+        all_candles.extend(candles)
+        remaining -= len(candles)
 
-            # 다음 페이지: 조회한 캔들 중 가장 오래된 시각 사용
-            oldest = candles[-1].get("candle_date_time_utc", "")
-            if oldest:
-                to_param = oldest
-            else:
-                break
+        # 다음 페이지: 조회한 캔들 중 가장 오래된 시각 사용
+        oldest = candles[-1].get("candle_date_time_utc", "")
+        if oldest:
+            to_param = oldest
+        else:
+            break
 
-            # 업비트 API 호출 제한 (초당 10회) 준수
-            if remaining > 0:
-                time.sleep(0.15)
+        # 업비트 API 호출 제한 (초당 10회) 준수
+        if remaining > 0:
+            time.sleep(0.15)
 
-            logger.info(f"  수집 중... {len(all_candles)}/{count}")
+        logger.info(f"  수집 중... {len(all_candles)}/{count}")
 
-        if all_candles:
-            df = pd.DataFrame(all_candles)
-            df = df.sort_values("candle_date_time_kst").reset_index(drop=True)
-            # 중복 제거 (페이지네이션 경계에서 발생 가능)
-            df = df.drop_duplicates(
-                subset=["candle_date_time_kst"], keep="first"
-            ).reset_index(drop=True)
-            df = df.rename(columns={
-                "opening_price": "open",
-                "high_price": "high",
-                "low_price": "low",
-                "trade_price": "close",
-                "candle_acc_trade_volume": "volume",
-            })
-            logger.info(f"시세 데이터 조회 완료: {len(df)}개 캔들")
-            return df
+    if all_candles:
+        df = pd.DataFrame(all_candles)
+        df = df.sort_values("candle_date_time_kst").reset_index(drop=True)
+        # 중복 제거 (페이지네이션 경계에서 발생 가능)
+        df = df.drop_duplicates(
+            subset=["candle_date_time_kst"], keep="first"
+        ).reset_index(drop=True)
+        df = df.rename(columns={
+            "opening_price": "open",
+            "high_price": "high",
+            "low_price": "low",
+            "trade_price": "close",
+            "candle_acc_trade_volume": "volume",
+        })
+        logger.info(f"시세 데이터 조회 완료: {len(df)}개 캔들")
+        return df
 
-    except Exception as e:
-        logger.warning(f"API 데이터 조회 실패: {e}")
-
-    logger.info("샘플 데이터를 사용합니다.")
-    return generate_sample_data(count)
+    return pd.DataFrame()
 
 
 # ============================================================
@@ -171,14 +123,15 @@ def run_backtest() -> None:
 
     # 데이터 로드
     client = UpbitClient(dry_run=True)
-    df = load_market_data(client, UPBIT_CFG.market, count=2000, unit=1)
+    df = load_market_data(client, UPBIT_CFG.market, count=BACKTEST_CANDLES,
+                         unit=BOT_CFG.candle_unit)
 
     if df.empty:
         logger.error("시세 데이터가 비어 있습니다. 종료합니다.")
         return
 
     # 백테스터 생성
-    bt = Backtester()
+    bt = Backtester(candle_seconds=BOT_CFG.candle_unit * 60)
 
     # 모든 전략 백테스트
     strategies = get_all_strategies()
@@ -208,30 +161,34 @@ def run_validate() -> None:
 
     # 데이터 로드
     client = UpbitClient(dry_run=True)
-    df = load_market_data(client, UPBIT_CFG.market, count=2000, unit=1)
+    df = load_market_data(client, UPBIT_CFG.market, count=BACKTEST_CANDLES,
+                         unit=BOT_CFG.candle_unit)
 
     if df.empty:
         logger.error("시세 데이터가 비어 있습니다. 종료합니다.")
         return
 
     # 백테스터 & 검증기 생성
-    bt = Backtester()
+    bt = Backtester(candle_seconds=BOT_CFG.candle_unit * 60)
     validator = Validator()
 
-    # 모든 전략 백테스트
-    strategies = get_all_strategies()
-    results = []
-
-    for strategy in strategies:
-        result = bt.run(strategy, df)
-        results.append(result)
-
-    # 검증 비교
-    validations = validator.compare_strategies(results)
+    # 인샘플/아웃오브샘플 분리 검증 (과최적화 방지)
+    validations = [
+        validator.validate_with_split(strategy, df, bt)
+        for strategy in get_all_strategies()
+    ]
+    validations.sort(key=lambda v: v.score, reverse=True)
     validator.print_comparison(validations)
 
+    # 전략이 이겨야 할 기준선: 같은 OOS 구간을 그냥 들고 있었을 때
+    split = int(len(df) * validator.config.in_sample_ratio)
+    hold_pct = (df["close"].iloc[-1] / df["open"].iloc[split] - 1) * 100
+    print(f"  기준선 — 아웃오브샘플 단순 보유: {hold_pct:+.2f}% "
+          f"({df['candle_date_time_kst'].iloc[split][:10]} ~ "
+          f"{df['candle_date_time_kst'].iloc[-1][:10]})\n")
+
     # 실거래 후보 선택
-    best_name = validator.select_live_strategy(results)
+    best_name = validator.select_live_strategy(validations)
     if best_name:
         print(f"\n✅ 실거래 추천 전략: {best_name}")
         print(f"   다음 명령으로 실거래를 시작하세요:")
@@ -304,13 +261,13 @@ def run_trade(strategy_name: str = "") -> None:
             # 단일 마켓 모드
             market = markets[0]
             client = UpbitClient(dry_run=BOT_CFG.dry_run)
-            risk_manager = RiskManager()
+            risk_manager = RiskManager(**strategy.risk_overrides)
             trader = Trader(
                 strategy=strategy,
                 client=client,
                 risk_manager=risk_manager,
                 market=market,
-                candle_unit=1,
+                candle_unit=BOT_CFG.candle_unit,
             )
             trader.run()
             return
@@ -321,12 +278,14 @@ def run_trade(strategy_name: str = "") -> None:
         for market in markets:
             traders.append(
                 Trader(
-                    strategy=strategy,
+                    # 마켓별 독립 인스턴스: AI 전략은 캔들 시각으로 신호를 캐시하므로
+                    # 인스턴스를 공유하면 다른 마켓의 신호를 그대로 재사용하게 된다.
+                    strategy=get_strategy_by_name(strategy.name) or strategy,
                     client=UpbitClient(dry_run=BOT_CFG.dry_run),
-                    risk_manager=RiskManager(),
+                    risk_manager=RiskManager(**strategy.risk_overrides),
                     market=market,
                     interval=BOT_CFG.interval_seconds,
-                    candle_unit=1,
+                    candle_unit=BOT_CFG.candle_unit,
                 )
             )
 
