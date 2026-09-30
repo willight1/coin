@@ -77,6 +77,7 @@ def install_error_alerts() -> None:
 HELP_TEXT = (
     "조회 전용 명령어\n"
     "/status — 현재가, 신호, 보유, 총자산\n"
+    "/market — 시장 상태 요약 (추세, 수익률, 변동성, 고점 대비)\n"
     "/help — 이 목록\n"
     "(매수·매도·중지 명령은 없다: 토큰이 새도 주문은 못 하게)"
 )
