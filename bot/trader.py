@@ -81,6 +81,8 @@ class Trader:
         # 같은 차단/보류 사유가 10초마다 반복 기록되지 않게 직전 사유를 기억한다
         self._last_block_key: str | None = None
         self._last_daily_notify = ""  # 하루 1회 상태 알림 (안 오면 봇이 죽은 것)
+        self._last_signal_df: pd.DataFrame | None = None  # /status 용 직전 확정봉 데이터
+        self._started_at = datetime.now()
         self.llm_gate = LLMGate()
         self.estimated_roundtrip_cost_pct = (
             (BT_CFG.fee_rate + BT_CFG.slippage_rate) * 2 * 100
@@ -143,6 +145,9 @@ class Trader:
                     logger.error(traceback.format_exc())
                     logger.info("30초 후 재시도합니다...")
                     time.sleep(30)
+
+                for cmd in notifier.poll_commands():
+                    self.handle_command(cmd)
 
                 # 다음 주기까지 대기
                 if not self.log_signal_change_only:
@@ -320,6 +325,7 @@ class Trader:
 
         # 진행 중인 현재 봉은 제외하고 직전 확정봉 기준으로 신호를 계산합니다.
         signal_df = df.iloc[:-1].copy()
+        self._last_signal_df = signal_df
         signal = self.strategy.generate_signal(signal_df)
         ai_driven = bool(getattr(self.strategy, "ai_driven", False))
         ai_meta = {}
@@ -759,6 +765,42 @@ class Trader:
         self._notify("봇 종료" + self._equity_text(equity))
         logger.info("  미체결 주문은 업비트 앱에서 확인하세요.")
         logger.info("트레이더 종료 완료.")
+
+    def handle_command(self, cmd: str) -> None:
+        """텔레그램 조회 명령에 답합니다. 상태 조회 실패가 매매 루프를 멈추지 않게 한다."""
+        try:
+            if cmd == "/status":
+                self._notify(self._status_text())
+            elif cmd in ("/help", "/start"):
+                self._notify(notifier.HELP_TEXT)
+            else:
+                self._notify(f"모르는 명령: {cmd}\n\n{notifier.HELP_TEXT}")
+        except Exception as e:
+            logger.warning(f"텔레그램 명령 처리 실패 ({cmd}): {e}")
+
+    def _status_text(self) -> str:
+        price = float(self.client.get_ticker(self.market).get("trade_price", 0))
+        krw = self._get_krw_balance()
+        coin = self._get_coin_balance()
+        avg = self._get_avg_buy_price()
+        lines = [
+            f"상태 — {self.strategy.name}",
+            f"현재가 {price:,.0f}",
+            f"신호 {self.last_notified_signal or '-'} "
+            f"(확정봉 {self.last_snapshot_candle[:10] or '-'})",
+        ]
+        if self._last_signal_df is not None:
+            extra = self.strategy.status_text(self._last_signal_df)
+            if extra:
+                lines.append(extra)
+        if coin > 0:
+            pnl = f", {(price / avg - 1) * 100:+.2f}%" if avg > 0 else ""
+            lines.append(f"보유 {coin:.8f} (평단 {avg:,.0f}{pnl})")
+        else:
+            lines.append("보유 없음 (현금)")
+        lines.append(f"현금 {krw:,.0f}원")
+        return ("\n".join(lines) + self._equity_text(krw + coin * price)
+                + f"\n가동 시작 {self._started_at:%m-%d %H:%M}")
 
     def _notify(self, text: str) -> None:
         mode = "DRY_RUN" if self.client.dry_run else "LIVE"
