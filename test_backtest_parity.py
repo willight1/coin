@@ -282,6 +282,45 @@ def check_no_entry_on_startup_candle() -> None:
     assert t.virtual_coin_balance > 0, "새 봉이 확정되면 매수해야 한다"
 
 
+def check_vwap_paper() -> None:
+    """VWAP 가상거래: VWAP-1% 통과 시 지정가 매수, VWAP 통과 시 매도, 세션 넘어가면 강제 청산."""
+    import tempfile
+    from datetime import datetime
+    from bot import vwap_paper as vp
+
+    assert vp.decide(False, 99.5, 100, 0.01) is None           # 지정가(99) 위 -> 대기
+    assert vp.decide(False, 98.9, 100, 0.01) == ("BUY", 99.0)   # 통과 -> 지정가 체결
+    assert vp.decide(True, 100.0, 100, 0.01) is None            # 닿기만 함 -> 미체결
+    assert vp.decide(True, 100.1, 100, 0.01) == ("SELL", 100)
+
+    class Fake:
+        price = 100.0
+        def get_ticker(self, market): return {"trade_price": self.price}
+        def get_candles_minutes(self, unit, market, count):
+            return [{"candle_date_time_kst": "2026-01-02T09:00:00", "high_price": 101.0,
+                     "low_price": 99.0, "trade_price": 100.0, "candle_acc_trade_volume": 10.0}]
+
+    sent, orig = [], vp.notifier.notify
+    vp.notifier.notify = sent.append
+    try:
+        t = vp.VwapPaperTrader("KRW-TEST", 1_000_000, 0.01, client=Fake())
+        d = tempfile.mkdtemp()
+        t.state_path, t.trades_path = os.path.join(d, "s.json"), os.path.join(d, "t.csv")
+        noon = datetime(2026, 1, 2, 12, 0)
+        for price in (99.5, 98.9):
+            t.client.price = price; t.tick(noon)
+        assert t.s["coin"] > 0 and t.s["entry"] == 99.0
+        t.client.price = 100.5; t.tick(noon)
+        assert t.s["coin"] == 0 and t.s["trades"] == 1 and t.s["wins"] == 1
+        assert t.s["krw"] > 1_000_000                                   # 99 -> 100, 수수료 0.1% 빼도 이익
+        t.client.price = 98.9; t.tick(noon)                             # 다시 매수
+        t.client.price = 97.0; t.tick(datetime(2026, 1, 3, 9, 5))       # 다음 세션 -> 강제 청산
+        assert t.s["coin"] == 0 and t.s["trades"] == 2 and t.s["wins"] == 1
+    finally:
+        vp.notifier.notify = orig
+    assert any("세션종료" in m for m in sent), sent
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
@@ -291,6 +330,7 @@ def main() -> None:
     check_market_summary()
     check_live_order_payload()
     check_no_entry_on_startup_candle()
+    check_vwap_paper()
     df = make_candles()
     failures = []
 

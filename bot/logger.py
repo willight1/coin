@@ -56,7 +56,9 @@ def get_logger(name: str) -> logging.Logger:
 
     # 날짜별 로그 파일
     today = datetime.now().strftime("%Y-%m-%d")
-    log_file = os.path.join(log_dir, f"trade_{today}.log")
+    # BOT_LOG_PREFIX 로 프로세스별 로그 파일을 나눈다 (예: VWAP 가상거래는 vwap_<날짜>.log)
+    prefix = os.getenv("BOT_LOG_PREFIX", "trade").strip() or "trade"
+    log_file = os.path.join(log_dir, f"{prefix}_{today}.log")
 
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(log_level)
