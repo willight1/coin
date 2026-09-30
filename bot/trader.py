@@ -27,12 +27,14 @@ import pandas as pd
 from .config import UPBIT_CFG, BOT_CFG, RISK_CFG, BT_CFG
 from .logger import get_logger
 from .paths import PROJECT_ROOT
-from .upbit_client import UpbitClient, UpbitClientError
+from .upbit_client import UpbitClient, UpbitClientError, load_market_data
 from .risk_manager import RiskManager, MIN_ORDER_KRW
 from .strategies import BaseStrategy, BUY, SELL, HOLD
 from .indicators import calc_atr
 from .llm_gate import LLMGate
 from . import notifier
+from .config import DAY_CANDLE_UNIT
+from .market_report import market_summary
 
 logger = get_logger(__name__)
 DEFAULT_DRY_RUN_KRW = 1_000_000.0
@@ -771,6 +773,11 @@ class Trader:
         try:
             if cmd == "/status":
                 self._notify(self._status_text())
+            elif cmd == "/market":
+                # 52주 고점·SMA200 에 1년치 일봉이 필요하다 (트레이더 캔들 창 200봉과 별개로 조회)
+                daily = load_market_data(self.client, self.market, count=400,
+                                         unit=DAY_CANDLE_UNIT)
+                self._notify("시장 상태\n" + market_summary(daily, self.strategy))
             elif cmd in ("/help", "/start"):
                 self._notify(notifier.HELP_TEXT)
             else:

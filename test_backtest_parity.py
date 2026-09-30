@@ -231,12 +231,29 @@ def check_telegram_commands() -> None:
     assert any("모르는 명령: /sell" in m for m in sent), sent
 
 
+def check_market_summary() -> None:
+    """꾸준히 오르면 '상승', 꾸준히 내리면 '하락', 데이터가 짧으면 안내."""
+    from bot.market_report import market_summary
+    from bot.strategies import SmaTrendStrategy
+
+    def daily(step: float) -> pd.DataFrame:
+        p = 100.0 * np.cumprod(np.full(300, 1 + step))
+        return pd.DataFrame({"open": p, "high": p * 1.01, "low": p * 0.99, "close": p})
+
+    up = market_summary(daily(0.005), SmaTrendStrategy(50))
+    down = market_summary(daily(-0.005))
+    assert "추세: 상승" in up and "전략 기준: SMA50" in up and "예측이 아닙니다" in up, up
+    assert "추세: 하락" in down and "전략 기준" not in down, down
+    assert "부족" in market_summary(daily(0.01).head(10))
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
     check_block_log_dedup()
     check_telegram()
     check_telegram_commands()
+    check_market_summary()
     df = make_candles()
     failures = []
 

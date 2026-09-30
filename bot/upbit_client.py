@@ -19,6 +19,7 @@ import time
 from urllib.parse import urlencode, unquote
 
 import jwt
+import pandas as pd
 import requests
 
 from .config import UPBIT_CFG, DAY_CANDLE_UNIT
@@ -450,3 +451,73 @@ class UpbitClient:
         params = {"uuid": uuid_str}
         logger.info(f"주문 취소: uuid={uuid_str}")
         return self._request("DELETE", "/v1/order", params=params, auth=True)
+
+
+def load_market_data(client: UpbitClient, market: str,
+                     count: int = 2000, unit: int = 1) -> pd.DataFrame:
+    """
+    업비트 API에서 시세 데이터를 조회합니다.
+    200개 제한을 우회하기 위해 여러 번 요청하여 합칩니다.
+    조회 실패는 예외로 올린다 — 가짜 데이터로 검증하면 결과가 무의미해진다.
+
+    Args:
+        client: 업비트 API 클라이언트
+        market: 마켓 코드
+        count: 목표 캔들 수 (200 초과 시 페이지네이션)
+        unit: 분봉 단위 (1, 3, 5, 15, 30, 60, 240, 1440=일봉)
+
+    Returns:
+        pd.DataFrame: OHLCV 데이터프레임
+    """
+    logger.info(f"업비트 API에서 {unit}분봉 데이터 조회: {market}, 목표 {count}개")
+    all_candles = []
+    remaining = count
+    to_param = None  # 페이지네이션용 시각 파라미터
+
+    while remaining > 0:
+        batch_size = min(remaining, 200)
+        params = {"market": market, "count": batch_size}
+        if to_param:
+            params["to"] = to_param
+
+        candles = client._request(
+            "GET", client.candles_endpoint(unit), params=params
+        )
+
+        if not candles:
+            break
+
+        all_candles.extend(candles)
+        remaining -= len(candles)
+
+        # 다음 페이지: 조회한 캔들 중 가장 오래된 시각 사용
+        oldest = candles[-1].get("candle_date_time_utc", "")
+        if oldest:
+            to_param = oldest
+        else:
+            break
+
+        # 업비트 API 호출 제한 (초당 10회) 준수
+        if remaining > 0:
+            time.sleep(0.15)
+
+        logger.info(f"  수집 중... {len(all_candles)}/{count}")
+
+    if all_candles:
+        df = pd.DataFrame(all_candles)
+        df = df.sort_values("candle_date_time_kst").reset_index(drop=True)
+        # 중복 제거 (페이지네이션 경계에서 발생 가능)
+        df = df.drop_duplicates(
+            subset=["candle_date_time_kst"], keep="first"
+        ).reset_index(drop=True)
+        df = df.rename(columns={
+            "opening_price": "open",
+            "high_price": "high",
+            "low_price": "low",
+            "trade_price": "close",
+            "candle_acc_trade_volume": "volume",
+        })
+        logger.info(f"시세 데이터 조회 완료: {len(df)}개 캔들")
+        return df
+
+    return pd.DataFrame()
