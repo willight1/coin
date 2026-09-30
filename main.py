@@ -18,6 +18,7 @@ main.py — CLI 진입점
 import argparse
 import sys
 import os
+import signal
 import time
 from datetime import datetime
 
@@ -26,6 +27,7 @@ import pandas as pd
 from bot.config import UPBIT_CFG, BOT_CFG, BT_CFG, RISK_CFG
 from bot.logger import get_logger
 from bot.upbit_client import UpbitClient
+from bot import notifier
 from bot.strategies import get_all_strategies, get_strategy_by_name
 from bot.backtester import Backtester
 from bot.validator import Validator
@@ -201,6 +203,10 @@ def run_validate() -> None:
         print("   전략 파라미터를 조정하거나 더 많은 데이터로 시도하세요.")
 
 
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def run_trade(strategy_name: str = "") -> None:
     """
     선정된 전략으로 실거래 또는 모의거래를 실행합니다.
@@ -262,6 +268,11 @@ def run_trade(strategy_name: str = "") -> None:
         if confirm.lower() != "yes":
             logger.info("사용자가 취소했습니다.")
             return
+
+    # 텔레그램: 모든 ERROR 로그를 알림으로 (설정 없으면 아무것도 안 함)
+    notifier.install_error_alerts()
+    # pkill/systemd stop(SIGTERM)도 Ctrl+C 처럼 안전 종료 경로(종료 알림 포함)를 타게 한다
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
     try:
         if len(markets) == 1:

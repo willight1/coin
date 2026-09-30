@@ -163,10 +163,30 @@ def check_block_log_dedup() -> None:
     assert len(logged) == 3, logged
 
 
+def check_telegram() -> None:
+    """토큰 없으면 전송 안 함, 같은 에러는 한 번만, 다른 에러는 보냄, INFO 는 무시."""
+    import logging
+    from bot import notifier
+    os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    assert notifier.notify("x") is False
+
+    sent = []
+    h = notifier.TelegramErrorHandler(repeat_after_sec=600, send=sent.append)
+    log = logging.getLogger("telegram-check")
+    log.propagate = False
+    log.addHandler(h)
+    log.error("API 오류: 타임아웃")
+    log.error("API 오류: 타임아웃")
+    log.error("다른 오류")
+    log.info("정보")
+    assert len(sent) == 2, sent
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
     check_block_log_dedup()
+    check_telegram()
     df = make_candles()
     failures = []
 

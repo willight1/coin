@@ -32,6 +32,7 @@ from .risk_manager import RiskManager, MIN_ORDER_KRW
 from .strategies import BaseStrategy, BUY, SELL, HOLD
 from .indicators import calc_atr
 from .llm_gate import LLMGate
+from . import notifier
 
 logger = get_logger(__name__)
 DEFAULT_DRY_RUN_KRW = 1_000_000.0
@@ -79,6 +80,7 @@ class Trader:
         self.state_synced = False
         # 같은 차단/보류 사유가 10초마다 반복 기록되지 않게 직전 사유를 기억한다
         self._last_block_key: str | None = None
+        self._last_daily_notify = ""  # 하루 1회 상태 알림 (안 오면 봇이 죽은 것)
         self.llm_gate = LLMGate()
         self.estimated_roundtrip_cost_pct = (
             (BT_CFG.fee_rate + BT_CFG.slippage_rate) * 2 * 100
@@ -118,7 +120,8 @@ class Trader:
         logger.info(f"  DRY_RUN: {self.client.dry_run}")
         logger.info("=" * 50)
         self._sync_existing_position()
-        self._log_account_snapshot("START")
+        equity = self._log_account_snapshot("START")
+        self._notify(f"봇 시작 — {self.strategy.name}" + self._equity_text(equity))
 
         if not self.client.dry_run:
             logger.warning("⚠️  LIVE 모드입니다! 실제 주문이 체결됩니다!")
@@ -378,8 +381,14 @@ class Trader:
 
         # 분 단위 계좌 스냅샷 (수익률 분석용)
         if signal_candle != self.last_snapshot_candle:
-            self._log_account_snapshot("TICK")
+            equity = self._log_account_snapshot("TICK")
             self.last_snapshot_candle = signal_candle
+            today = datetime.now().strftime("%Y-%m-%d")
+            if today != self._last_daily_notify:
+                self._last_daily_notify = today
+                self._notify(
+                    f"일일 상태 — 신호 {signal} (확정봉 {signal_candle[:10]}), "
+                    f"현재가 {current_price:,.0f}" + self._equity_text(equity))
 
         # ---- 3. 손절/추세이탈/트레일링스탑 확인 ----
         if self.risk_manager.state.current_positions > 0:
@@ -731,6 +740,9 @@ class Trader:
                 f"price={price:,.0f} coin_value={coin_value:,.0f} "
                 f"equity={equity:,.0f}"
             )
+            if stage == "AFTER":
+                label = "매수" if side == "BUY" else "매도"
+                self._notify(f"{label} 체결 @ {price:,.0f}" + self._equity_text(equity))
         except Exception as e:
             logger.info(f"  >> 자산[{side}:{stage}] 조회 실패: {e}")
 
@@ -743,12 +755,26 @@ class Trader:
         logger.info("안전 종료 중...")
         logger.info(f"  현재 포지션 수: "
                      f"{self.risk_manager.state.current_positions}")
-        self._log_account_snapshot("END")
+        equity = self._log_account_snapshot("END")
+        self._notify("봇 종료" + self._equity_text(equity))
         logger.info("  미체결 주문은 업비트 앱에서 확인하세요.")
         logger.info("트레이더 종료 완료.")
 
-    def _log_account_snapshot(self, label: str) -> None:
-        """계좌 스냅샷(추정 총자산)을 로그로 남깁니다."""
+    def _notify(self, text: str) -> None:
+        mode = "DRY_RUN" if self.client.dry_run else "LIVE"
+        notifier.notify(f"[{mode} {self.market}] {text}")
+
+    def _equity_text(self, equity: float | None) -> str:
+        if equity is None:
+            return ""
+        text = f"\n총자산 {equity:,.0f}원"
+        if self.client.dry_run:
+            base = float(os.getenv("BOT_DRY_RUN_INITIAL_KRW", str(DEFAULT_DRY_RUN_KRW)))
+            text += f" ({(equity / base - 1) * 100:+.2f}%)"
+        return text
+
+    def _log_account_snapshot(self, label: str) -> float | None:
+        """계좌 스냅샷(추정 총자산)을 로그로 남기고 총자산을 반환합니다 (실패 시 None)."""
         try:
             krw_balance = self._get_krw_balance()
             coin_balance = self._get_coin_balance()
@@ -764,10 +790,12 @@ class Trader:
                 f"coin_value={coin_value:.2f} price={current_price:.2f} "
                 f"avg_buy={avg_buy_price:.2f} buy_cost={buy_cost:.2f}"
             )
+            return equity
         except UpbitClientError as e:
             logger.info(f"[계좌] {label} 스냅샷 실패: {e}")
         except Exception as e:
             logger.info(f"[계좌] {label} 스냅샷 예외: {e}")
+        return None
 
     def _get_krw_balance(self) -> float:
         """KRW 잔고 조회 (DRY_RUN이면 가상잔고 반환)."""
