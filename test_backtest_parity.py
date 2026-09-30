@@ -142,9 +142,31 @@ def check_dry_run_state() -> None:
     assert t2.risk_manager.state.current_positions == 1
 
 
+def check_block_log_dedup() -> None:
+    """숫자만 다른 같은 차단 사유는 한 번만 기록되고, 주문/신호 변경 뒤엔 다시 기록된다."""
+    import bot.trader as tr_mod
+    t = Trader(strategy=get_all_strategies()[0], client=FakeClient(make_candles(5)),
+               risk_manager=RiskManager(), market="KRW-TEST")
+    t.log_signal_change_only = True
+    logged = []
+    orig = tr_mod.logger.info
+    tr_mod.logger.info = logged.append
+    try:
+        for pct in ("0.45", "0.43", "0.41"):
+            t._log_block(f"  매수 차단: 추격매수 제한 초과 (현재 {pct}%)")
+        t._log_block("  매수 차단: 최대 포지션 수 초과: 1/1")
+        t._log_block("  매수 차단: 최대 포지션 수 초과: 1/1")
+        t._last_block_key = None  # 주문 실행/신호 변경 시 초기화
+        t._log_block("  매수 차단: 최대 포지션 수 초과: 1/1")
+    finally:
+        tr_mod.logger.info = orig
+    assert len(logged) == 3, logged
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
+    check_block_log_dedup()
     df = make_candles()
     failures = []
 
