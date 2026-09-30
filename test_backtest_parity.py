@@ -247,6 +247,18 @@ def check_market_summary() -> None:
     assert "부족" in market_summary(daily(0.01).head(10))
 
 
+def check_live_order_payload() -> None:
+    """실주문 페이로드: 소수점 금액은 정수 원, 소액 수량은 지수 표기 없이 8자리."""
+    from bot.upbit_client import UpbitClient
+    c = UpbitClient(access_key="a", secret_key="b", dry_run=False)
+    sent = []
+    c._request = lambda method, endpoint, params=None, data=None, auth=False: sent.append(data) or {}
+    c.order_market_buy(market="KRW-BTC", price=497500.5)
+    c.order_market_sell(market="KRW-BTC", volume=0.00001)
+    assert sent[0]["price"] == "497500", sent
+    assert sent[1]["volume"] == "0.00001000", sent
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
@@ -254,6 +266,7 @@ def main() -> None:
     check_telegram()
     check_telegram_commands()
     check_market_summary()
+    check_live_order_payload()
     df = make_candles()
     failures = []
 

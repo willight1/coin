@@ -193,10 +193,18 @@ def run_trade(strategy_name: str = "") -> None:
         print("  → BOT_DRY_RUN=true 로 변경하면 모의거래입니다.")
         print("!" * 50)
 
-        confirm = input("\n정말 LIVE 모드로 시작하시겠습니까? (yes/no): ").strip()
-        if confirm.lower() != "yes":
-            logger.info("사용자가 취소했습니다.")
+        # 백그라운드(nohup, 서버)에서는 입력을 받을 수 없으므로 환경변수로 확인한다
+        if os.getenv("BOT_LIVE_CONFIRM", "").strip().lower() == "yes":
+            logger.warning("BOT_LIVE_CONFIRM=yes — LIVE 모드로 시작합니다.")
+        elif not sys.stdin.isatty():
+            logger.error("LIVE 모드 확인 입력을 받을 수 없습니다 (백그라운드 실행).")
+            logger.error("BOT_LIVE_CONFIRM=yes 를 함께 지정해 실행하세요.")
             return
+        else:
+            confirm = input("\n정말 LIVE 모드로 시작하시겠습니까? (yes/no): ").strip()
+            if confirm.lower() != "yes":
+                logger.info("사용자가 취소했습니다.")
+                return
 
     # 텔레그램: 모든 ERROR 로그를 알림으로 (설정 없으면 아무것도 안 함)
     notifier.install_error_alerts()
