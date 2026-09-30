@@ -259,6 +259,29 @@ def check_live_order_payload() -> None:
     assert sent[1]["volume"] == "0.00001000", sent
 
 
+def check_no_entry_on_startup_candle() -> None:
+    """추세 한가운데서 봇을 켜도, 켜기 전에 확정된 봉으로는 사지 않고 다음 봉에서 산다."""
+    from bot.strategies import SmaTrendStrategy
+    rows = []
+    for i in range(120):
+        p = 50_000_000 * (1.002 ** i)                 # 꾸준한 상승 -> 계속 BUY 신호
+        rows.append({"open": p, "high": p, "low": p, "close": p, "volume": 100.0,
+                     "candle_date_time_kst": f"2026-01-{1 + i // 24:02d}T{i % 24:02d}:00:00"})
+    df = pd.DataFrame(rows)
+    t = Trader(strategy=SmaTrendStrategy(50), client=FakeClient(df), market="KRW-TEST",
+               candle_unit=1)
+    t.state_path = None
+    t.virtual_krw_balance = 1_000_000
+    t.client.cursor = 100
+    t._tick()
+    assert t.virtual_coin_balance == 0, "시작 시점 봉으로 매수하면 안 된다"
+    t._tick()                                          # 같은 봉에서 다시 틱 -> 여전히 보류
+    assert t.virtual_coin_balance == 0
+    t.client.cursor = 101                              # 새 봉 확정
+    t._tick()
+    assert t.virtual_coin_balance > 0, "새 봉이 확정되면 매수해야 한다"
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
@@ -267,6 +290,7 @@ def main() -> None:
     check_telegram_commands()
     check_market_summary()
     check_live_order_payload()
+    check_no_entry_on_startup_candle()
     df = make_candles()
     failures = []
 

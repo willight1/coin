@@ -85,6 +85,10 @@ class Trader:
         self._last_daily_notify = ""  # 하루 1회 상태 알림 (안 오면 봇이 죽은 것)
         self._last_signal_df: pd.DataFrame | None = None  # /status 용 직전 확정봉 데이터
         self._started_at = datetime.now()
+        # 봇이 켜진 시점에 이미 확정돼 있던 봉으로는 새로 매수하지 않는다.
+        # 백테스트는 '확정 직후 다음 봉 시가'에만 진입하는데, 하루 중간에 켜면 그 시점이 이미 지났다.
+        # (예전엔 새벽에 켜면 기준가 아래로 급락하는 도중에 매수될 수 있었다.) 매도는 막지 않는다.
+        self._startup_candle: str | None = None
         self.llm_gate = LLMGate()
         self.estimated_roundtrip_cost_pct = (
             (BT_CFG.fee_rate + BT_CFG.slippage_rate) * 2 * 100
@@ -339,6 +343,8 @@ class Trader:
             if "candle_date_time_kst" in signal_df.columns
             else signal_df.index[-1]
         )
+        if self._startup_candle is None:
+            self._startup_candle = signal_candle  # 첫 틱에서 기록 (아래 보유 처리의 return 보다 먼저)
         if signal != self.last_notified_signal:
             prev = self.last_notified_signal or "NONE"
             logger.info(
@@ -456,7 +462,11 @@ class Trader:
                 return
 
         # ---- 4. 매수 처리 ----
-        if effective_signal == BUY:
+        if effective_signal == BUY and signal_candle == self._startup_candle:
+            self._log_block(
+                f"  매수 보류: 봇 시작 전에 확정된 봉({signal_candle[:16]}) — "
+                "다음 봉이 확정되면 진입 (백테스트와 같은 시점)")
+        elif effective_signal == BUY:
             # ATR 기반 변동성 체크 (선택적)
             atr = 0
             avg_atr = 0
