@@ -6,6 +6,7 @@ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 가 없으면 아무것도 하지 않는�
 
 - notify(text): 한 줄 알림 (체결, 시작/종료, 일일 요약)
 - install_error_alerts(): 모든 ERROR 로그를 텔레그램으로 보낸다 (같은 메시지는 10분에 한 번)
+- poll_commands(): 내 chat 에서 온 새 명령어(/status 등)를 가져온다. 조회 전용 — 주문 명령은 일부러 없다
 """
 
 import logging
@@ -71,3 +72,47 @@ def install_error_alerts() -> None:
     root = logging.getLogger()
     if enabled() and not any(isinstance(h, TelegramErrorHandler) for h in root.handlers):
         root.addHandler(TelegramErrorHandler())
+
+
+HELP_TEXT = (
+    "조회 전용 명령어\n"
+    "/status — 현재가, 신호, 보유, 총자산\n"
+    "/help — 이 목록\n"
+    "(매수·매도·중지 명령은 없다: 토큰이 새도 주문은 못 하게)"
+)
+
+_update_offset = 0  # 확인한 마지막 update_id + 1 (같은 명령에 두 번 답하지 않게)
+
+
+def poll_commands() -> list[str]:
+    """
+    등록된 chat 에서 온 새 명령어(예: '/status')를 반환합니다.
+    다른 사람이 봇에게 보낸 메시지는 무시한다 (봇 사용자명은 누구나 검색 가능).
+    실패하면 빈 목록 — 매매 루프를 막지 않는다.
+    """
+    global _update_offset
+    token, chat_id = _creds()
+    if not (token and chat_id):
+        return []
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": _update_offset, "timeout": 0},
+            timeout=5,
+        )
+        updates = r.json().get("result", []) if r.status_code == 200 else []
+    except Exception as e:
+        _log.warning(f"텔레그램 명령 조회 예외: {e}")
+        return []
+
+    commands = []
+    for u in updates:
+        _update_offset = max(_update_offset, u.get("update_id", 0) + 1)
+        msg = u.get("message") or {}
+        if str((msg.get("chat") or {}).get("id")) != chat_id:
+            continue
+        text = (msg.get("text") or "").strip()
+        if text.startswith("/"):
+            # '/status@juno_coin_bot 인자' -> '/status'
+            commands.append(text.split()[0].split("@")[0].lower())
+    return commands

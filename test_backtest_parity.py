@@ -182,11 +182,61 @@ def check_telegram() -> None:
     assert len(sent) == 2, sent
 
 
+def check_telegram_commands() -> None:
+    """내 chat 의 명령만 받고, 같은 update 는 두 번 처리하지 않고, /status 가 상태를 답한다."""
+    from bot import notifier
+    saved = {k: os.environ.get(k) for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")}
+    os.environ.update(TELEGRAM_BOT_TOKEN="T", TELEGRAM_CHAT_ID="111")
+    updates = [
+        {"update_id": 5, "message": {"chat": {"id": 111}, "text": "/status@juno_coin_bot"}},
+        {"update_id": 6, "message": {"chat": {"id": 999}, "text": "/status"}},  # 남의 chat
+        {"update_id": 7, "message": {"chat": {"id": 111}, "text": "hello"}},    # 명령 아님
+    ]
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, result):
+            self._r = result
+
+        def json(self):
+            return {"result": self._r}
+
+    orig_get, orig_notify = notifier.requests.get, notifier.notify
+    sent = []
+    try:
+        notifier._update_offset = 0
+        notifier.requests.get = lambda url, params, timeout: Resp(
+            [u for u in updates if u["update_id"] >= params["offset"]])
+        assert notifier.poll_commands() == ["/status"]
+        assert notifier.poll_commands() == []          # offset 이 넘어가서 재처리 없음
+
+        notifier.notify = lambda text: sent.append(text) or True
+        strategy = get_all_strategies()[-1]            # 일봉 SMA 추세 (status_text 있음)
+        df = make_candles(80)
+        t = Trader(strategy=strategy, client=FakeClient(df), risk_manager=RiskManager(),
+                   market="KRW-TEST", candle_unit=1)
+        t.state_path = None
+        t.client.cursor = 79
+        t._tick()
+        t.handle_command("/status")
+        t.handle_command("/sell")                     # 주문 명령은 없다 -> 안내만
+    finally:
+        notifier.requests.get, notifier.notify = orig_get, orig_notify
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    status = [m for m in sent if "] 상태 —" in m]
+    assert status and "현재가" in status[0] and "SMA50" in status[0], sent
+    assert any("모르는 명령: /sell" in m for m in sent), sent
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
     check_block_log_dedup()
     check_telegram()
+    check_telegram_commands()
     df = make_candles()
     failures = []
 

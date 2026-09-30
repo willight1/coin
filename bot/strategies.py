@@ -85,6 +85,10 @@ class BaseStrategy(ABC):
         """
         pass
 
+    def status_text(self, df: pd.DataFrame) -> str:
+        """텔레그램 /status 에 덧붙일 전략 상태 한 줄 (없으면 빈 문자열)."""
+        return ""
+
     def generate_signals_series(self, df: pd.DataFrame) -> pd.Series:
         """
         전체 데이터에 대해 각 시점의 신호를 생성합니다. (백테스트용)
@@ -866,6 +870,15 @@ class SmaTrendStrategy(BaseStrategy):
 
     def generate_signal(self, df: pd.DataFrame) -> str:
         return self.generate_signals_series(df).iloc[-1]
+
+    def status_text(self, df: pd.DataFrame) -> str:
+        sma = df["close"].rolling(self.period).mean().iloc[-1]
+        close = df["close"].iloc[-1]
+        if pd.isna(sma) or sma <= 0:
+            return ""
+        side = "위 → 보유" if close > sma else "아래 → 현금"
+        return (f"SMA{self.period} {sma:,.0f} / 확정 종가 {close:,.0f} "
+                f"({(close / sma - 1) * 100:+.2f}%, {side})")
 
     def generate_signals_series(self, df: pd.DataFrame) -> pd.Series:
         sma = df["close"].rolling(self.period).mean()

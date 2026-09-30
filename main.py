@@ -312,6 +312,9 @@ def run_trade(strategy_name: str = "") -> None:
             for t in traders:
                 t.run_once()
                 time.sleep(inter_market_delay)
+            for cmd in notifier.poll_commands():
+                for t in traders:
+                    t.handle_command(cmd)
             logger.info(f"다음 조회까지 {BOT_CFG.interval_seconds}초 대기...")
             time.sleep(BOT_CFG.interval_seconds)
     except KeyboardInterrupt:
