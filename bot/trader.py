@@ -17,6 +17,7 @@ trader.py — 실거래 엔진
 
 import json
 import os
+import re
 import time
 import traceback
 from datetime import datetime
@@ -76,6 +77,8 @@ class Trader:
             in ("1", "true", "yes", "y")
         )
         self.state_synced = False
+        # 같은 차단/보류 사유가 10초마다 반복 기록되지 않게 직전 사유를 기억한다
+        self._last_block_key: str | None = None
         self.llm_gate = LLMGate()
         self.estimated_roundtrip_cost_pct = (
             (BT_CFG.fee_rate + BT_CFG.slippage_rate) * 2 * 100
@@ -161,6 +164,18 @@ class Trader:
         except Exception as e:
             logger.error(f"[{self.market}] 예상치 못한 오류: {e}")
             logger.error(traceback.format_exc())
+
+    def _log_block(self, msg: str) -> None:
+        """
+        매수 차단/매도 보류 사유를 기록합니다. 숫자만 다른 같은 사유가 연속되면 생략한다.
+        (보유 중 '최대 포지션 수 초과'가 틱마다 찍혀 하루 8천 줄이 쌓이던 문제)
+        신호가 바뀌거나 주문이 나가면 초기화되어 다음 사유는 다시 기록된다.
+        """
+        key = re.sub(r"[\d,.%+-]+", "#", msg)
+        if self.log_signal_change_only and key == self._last_block_key:
+            return
+        self._last_block_key = key
+        logger.info(msg)
 
     def _load_dry_run_state(self) -> None:
         """저장된 DRY_RUN 가상 잔고/포지션을 복원합니다 (실거래의 계좌 동기화에 해당)."""
@@ -320,6 +335,7 @@ class Trader:
                 f"(확정봉: {signal_candle}, 현재가: {current_price:,.0f} KRW)"
             )
             self.last_notified_signal = signal
+            self._last_block_key = None
         elif not self.log_signal_change_only:
             logger.info(f"  전략 신호: {signal} (확정봉: {signal_candle})")
 
@@ -401,11 +417,11 @@ class Trader:
                     effective_signal, self.market, current_price)
 
                 if self._is_duplicate_signal_order(signal_candle):
-                    logger.info("  매도 보류: 같은 확정봉에서 중복 신호 주문 방지")
+                    self._log_block("  매도 보류: 같은 확정봉에서 중복 신호 주문 방지")
                 elif not min_profit_ok:
-                    logger.info(f"  매도 보류: {min_profit_reason}")
+                    self._log_block(f"  매도 보류: {min_profit_reason}")
                 elif not allowed:
-                    logger.info(f"  매도 차단: {reason}")
+                    self._log_block(f"  매도 차단: {reason}")
                 else:
                     if self._execute_sell(current_price, reason="TREND_EXIT"):
                         self.last_signal_order_candle = signal_candle
@@ -455,13 +471,13 @@ class Trader:
 
             if allowed:
                 if self._is_duplicate_signal_order(signal_candle):
-                    logger.info("  매수 차단: 같은 확정봉에서 중복 신호 주문 방지")
+                    self._log_block("  매수 차단: 같은 확정봉에서 중복 신호 주문 방지")
                     return
 
                 chase_ok, chase_reason = self.risk_manager.check_chase(
                     signal_price, current_price)
                 if not chase_ok:
-                    logger.info(f"  매수 차단: {chase_reason}")
+                    self._log_block(f"  매수 차단: {chase_reason}")
                     return
 
                 buy_amount = self.risk_manager.get_buy_amount(krw_balance)
@@ -476,7 +492,7 @@ class Trader:
                         buy_amount = adjusted
 
                     if gate_decision and not gate_decision.allow:
-                        logger.info(
+                        self._log_block(
                             "  매수 차단: AI 분석 결과 "
                             f"({gate_decision.source}, conf={gate_decision.confidence:.2f}) "
                             f"{gate_decision.reason}"
@@ -484,7 +500,7 @@ class Trader:
                         return
 
                     if buy_amount < MIN_ORDER_KRW:
-                        logger.info(
+                        self._log_block(
                             "  매수 차단: 최소주문금액 미만 "
                             f"({buy_amount:,.0f} KRW < {MIN_ORDER_KRW:,.0f} KRW)"
                         )
@@ -502,7 +518,7 @@ class Trader:
                     elif ai_driven:
                         ai_size_multiplier = max(0.0, min(1.0, float(ai_meta.get("size_multiplier", 1.0))))
                         if ai_size_multiplier <= 0:
-                            logger.info("  매수 차단: AI 자율 전략 size_multiplier=0")
+                            self._log_block("  매수 차단: AI 자율 전략 size_multiplier=0")
                             return
                         if ai_size_multiplier < 1.0:
                             adjusted = buy_amount * ai_size_multiplier
@@ -518,12 +534,12 @@ class Trader:
                 else:
                     logger.info("  매수 금액이 0원 — 매수 건너뜀")
             else:
-                logger.info(f"  매수 차단: {reason}")
+                self._log_block(f"  매수 차단: {reason}")
 
         # ---- 5. 매도 처리 ----
         elif effective_signal == SELL:
             if gate_decision and not gate_decision.allow:
-                logger.info(
+                self._log_block(
                     "  매도 보류: AI 분석 결과 "
                     f"({gate_decision.source}, conf={gate_decision.confidence:.2f}) "
                     f"{gate_decision.reason}"
@@ -531,7 +547,7 @@ class Trader:
                 return
 
             if self._is_duplicate_signal_order(signal_candle):
-                logger.info("  매도 차단: 같은 확정봉에서 중복 신호 주문 방지")
+                self._log_block("  매도 차단: 같은 확정봉에서 중복 신호 주문 방지")
                 return
 
             min_profit_ok, min_profit_reason = (
@@ -542,7 +558,7 @@ class Trader:
                 )
             )
             if not min_profit_ok:
-                logger.info(f"  매도 보류: {min_profit_reason}")
+                self._log_block(f"  매도 보류: {min_profit_reason}")
                 return
 
             allowed, reason = self.risk_manager.check_sell(
@@ -552,7 +568,7 @@ class Trader:
                 if self._execute_sell(current_price, reason="TREND_EXIT"):
                     self.last_signal_order_candle = signal_candle
             else:
-                logger.info(f"  매도 차단: {reason}")
+                self._log_block(f"  매도 차단: {reason}")
 
         else:
             if not self.log_signal_change_only:
@@ -566,6 +582,7 @@ class Trader:
             amount: 매수 금액 (KRW)
             current_price: 참고용 현재가
         """
+        self._last_block_key = None
         logger.info(f"  >> 매수 실행: {amount:,.0f} KRW")
         self._log_trade_balance_snapshot("BUY", "BEFORE", current_price=current_price)
 
@@ -622,6 +639,7 @@ class Trader:
             current_price: 참고용 현재가
             reason: 매도 사유 (TREND_EXIT, STOP_LOSS, TRAILING_STOP)
         """
+        self._last_block_key = None
         logger.info(f"  >> 매도 실행 (사유: {reason})")
         self._log_trade_balance_snapshot("SELL", "BEFORE", current_price=current_price)
 
