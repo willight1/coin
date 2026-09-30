@@ -268,6 +268,17 @@ def run_trade(strategy_name: str = "") -> None:
         except Exception as e:
             logger.warning(f"자동 리뷰 생성 실패: {e}")
 
+def run_vwap_paper() -> None:
+    """VWAP 회귀 가상거래. 시세 조회만 하고 주문은 하지 않는다 (추세 봇과 돈이 섞이지 않음)."""
+    from bot import vwap_paper
+    markets = [m.strip().upper() for m in os.getenv("VWAP_MARKETS", "KRW-BTC,KRW-ETH").split(",") if m.strip()]
+    budget = float(os.getenv("VWAP_PAPER_KRW", "1000000"))
+    entry_pct = float(os.getenv("VWAP_ENTRY_PCT", "0.01"))
+    notifier.install_error_alerts()
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    vwap_paper.run(markets, budget, entry_pct)
+
+
 def run_review(date_str: str = "") -> None:
     """
     실행 로그를 분석하여 일일 수익률/전략 리뷰를 생성합니다.
@@ -301,13 +312,14 @@ def main():
   python main.py --mode trade --strategy "RSI 과매도/과매수"  # 특정 전략
   python main.py --mode review                # 오늘 로그 리뷰
   python main.py --mode review --date 2026-03-25
+  BOT_LOG_PREFIX=vwap python main.py --mode vwap-paper   # VWAP 회귀 가상거래 (실제 주문 없음)
         """,
     )
 
     parser.add_argument(
         "--mode", "-m",
         required=True,
-        choices=["backtest", "validate", "trade", "review"],
+        choices=["backtest", "validate", "trade", "review", "vwap-paper"],
         help="실행 모드 (backtest / validate / trade / review)",
     )
     parser.add_argument(
@@ -339,6 +351,8 @@ def main():
         run_trade(args.strategy)
     elif args.mode == "review":
         run_review(args.date)
+    elif args.mode == "vwap-paper":
+        run_vwap_paper()
     else:
         parser.print_help()
 
