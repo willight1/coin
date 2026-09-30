@@ -327,7 +327,8 @@ class UpbitClient:
         data = {
             "market": market,
             "side": "bid",
-            "price": str(price),
+            # 원 단위 정수로 (497500.5 같은 소수점 금액은 거부될 수 있다)
+            "price": str(int(price)),
             "ord_type": "price",  # 시장가 매수
         }
         logger.info(f"시장가 매수 주문: {market}, 금액={price} KRW")
@@ -355,7 +356,7 @@ class UpbitClient:
         data = {
             "market": market,
             "side": "ask",
-            "volume": str(volume),
+            "volume": format_volume(volume),  # str(0.00001) == '1e-05' -> 거부됨
             "ord_type": "market",  # 시장가 매도
         }
         logger.info(f"시장가 매도 주문: {market}, 수량={volume}")
@@ -385,7 +386,7 @@ class UpbitClient:
             "market": market,
             "side": "bid",
             "price": str(price),
-            "volume": str(volume),
+            "volume": format_volume(volume),  # str(0.00001) == '1e-05' -> 거부됨
             "ord_type": "limit",
         }
         logger.info(f"지정가 매수 주문: {market}, 가격={price}, 수량={volume}")
@@ -415,7 +416,7 @@ class UpbitClient:
             "market": market,
             "side": "ask",
             "price": str(price),
-            "volume": str(volume),
+            "volume": format_volume(volume),  # str(0.00001) == '1e-05' -> 거부됨
             "ord_type": "limit",
         }
         logger.info(f"지정가 매도 주문: {market}, 가격={price}, 수량={volume}")
@@ -451,6 +452,11 @@ class UpbitClient:
         params = {"uuid": uuid_str}
         logger.info(f"주문 취소: uuid={uuid_str}")
         return self._request("DELETE", "/v1/order", params=params, auth=True)
+
+
+def format_volume(volume: float) -> str:
+    """주문 수량을 지수 표기 없이 소수 8자리(업비트 최대)로. 반올림하면 보유량을 넘을 수 있어 내림."""
+    return f"{int(volume * 1e8) / 1e8:.8f}"
 
 
 def load_market_data(client: UpbitClient, market: str,
