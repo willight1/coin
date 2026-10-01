@@ -321,6 +321,31 @@ def check_vwap_paper() -> None:
     assert any("세션종료" in m for m in sent), sent
 
 
+def check_signal_change_alert() -> None:
+    """추세 신호가 바뀌면(BUY<->SELL) 거래와 무관하게 알림이 나간다. 같은 신호 반복은 알리지 않는다."""
+    import bot.trader as tr_mod
+    from bot.strategies import SmaTrendStrategy
+    up = [50_000_000 * (1.002 ** i) for i in range(80)]
+    down = [up[-1] * (0.99 ** i) for i in range(1, 40)]
+    rows = [{"open": p, "high": p, "low": p, "close": p, "volume": 1.0,
+             "candle_date_time_kst": f"2026-02-{1 + i // 24:02d}T{i % 24:02d}:00:00"}
+            for i, p in enumerate(up + down)]
+    t = Trader(strategy=SmaTrendStrategy(50), client=FakeClient(pd.DataFrame(rows)),
+               market="KRW-TEST", candle_unit=1)
+    t.state_path = None
+    sent, orig = [], tr_mod.notifier.notify
+    tr_mod.notifier.notify = sent.append
+    try:
+        for i in range(60, len(rows)):
+            t.client.cursor = i
+            t._tick()
+    finally:
+        tr_mod.notifier.notify = orig
+    alerts = [m for m in sent if "추세" in m]
+    assert len(alerts) == 2, alerts                       # 시작 시 현재 신호 1번 + 전환 1번
+    assert "현재 추세 신호: 상승" in alerts[0] and "추세 전환: 상승(매수) → 하락(매도)" in alerts[1], alerts
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
@@ -331,6 +356,7 @@ def main() -> None:
     check_live_order_payload()
     check_no_entry_on_startup_candle()
     check_vwap_paper()
+    check_signal_change_alert()
     df = make_candles()
     failures = []
 

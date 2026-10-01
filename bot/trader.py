@@ -351,6 +351,7 @@ class Trader:
                 f"  전략 신호 변경: {prev} -> {signal} "
                 f"(확정봉: {signal_candle}, 현재가: {current_price:,.0f} KRW)"
             )
+            self._notify_signal_change(prev, signal, signal_df, signal_candle, current_price)
             self.last_notified_signal = signal
             self._last_block_key = None
         elif not self.log_signal_change_only:
@@ -818,6 +819,29 @@ class Trader:
         lines.append(f"현금 {krw:,.0f}원")
         return ("\n".join(lines) + self._equity_text(krw + coin * price)
                 + f"\n가동 시작 {self._started_at:%m-%d %H:%M}")
+
+    def _notify_signal_change(self, prev: str, signal: str, signal_df: pd.DataFrame,
+                              signal_candle: str, price: float) -> None:
+        """
+        추세 신호가 바뀌면 거래 여부와 상관없이 텔레그램으로 알린다.
+        봇 시작 직후(NONE -> X)에는 '현재 신호'로 한 번 알린다 (꺼져 있던 동안 바뀌었을 수 있으므로).
+        HOLD 로/에서의 변화는 알리지 않는다 (분봉 전략에서 잦은 잡음).
+        """
+        if signal == HOLD or prev == HOLD:
+            return
+        names = {BUY: "상승(매수)", SELL: "하락(매도)"}
+        holding = self.risk_manager.state.current_positions > 0
+        if prev == "NONE":
+            head = f"현재 추세 신호: {names.get(signal, signal)}"
+        else:
+            head = f"⚠️ 추세 전환: {names.get(prev, prev)} → {names.get(signal, signal)}"
+        if signal == SELL:
+            plan = "보유 중 → 전량 매도합니다" if holding else "보유 없음 → 매수하지 않고 대기"
+        else:
+            plan = "이미 보유 중 → 계속 보유" if holding else "보유 없음 → 매수합니다(새 봉 확정 직후)"
+        extra = self.strategy.status_text(signal_df)
+        self._notify(f"{head}\n확정봉 {signal_candle[:10]}, 현재가 {price:,.0f}"
+                     + (f"\n{extra}" if extra else "") + f"\n{plan}")
 
     def _notify(self, text: str) -> None:
         mode = "DRY_RUN" if self.client.dry_run else "LIVE"
