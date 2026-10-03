@@ -83,6 +83,10 @@ class Trader:
         # 같은 차단/보류 사유가 10초마다 반복 기록되지 않게 직전 사유를 기억한다
         self._last_block_key: str | None = None
         self._last_daily_notify = ""  # 하루 1회 상태 알림 (안 오면 봇이 죽은 것)
+        # 장중 경고: 기준선(오늘 종가가 넘으면/깨면 신호가 바뀌는 가격)까지의 거리 단계
+        self.warn_pct = float(os.getenv("TREND_WARN_PCT", "0.03"))
+        self._warn_candle = ""
+        self._warn_level = "safe"
         self._last_signal_df: pd.DataFrame | None = None  # /status 용 직전 확정봉 데이터
         self._started_at = datetime.now()
         # 봇이 켜진 시점에 이미 확정돼 있던 봉으로는 새로 매수하지 않는다.
@@ -356,6 +360,7 @@ class Trader:
             self._last_block_key = None
         elif not self.log_signal_change_only:
             logger.info(f"  전략 신호: {signal} (확정봉: {signal_candle})")
+        self._check_intraday_warning(signal_df, signal_candle, current_price)
 
         gate_decision = None
         effective_signal = signal
@@ -819,6 +824,42 @@ class Trader:
         lines.append(f"현금 {krw:,.0f}원")
         return ("\n".join(lines) + self._equity_text(krw + coin * price)
                 + f"\n가동 시작 {self._started_at:%m-%d %H:%M}")
+
+    def _check_intraday_warning(self, signal_df: pd.DataFrame, signal_candle: str,
+                                price: float) -> None:
+        """
+        장중 가격이 기준선에 가까워지거나 넘어서면 미리 알린다 (확정은 봉 마감 때).
+        보유 중: 기준선 아래로 마감하면 매도 / 미보유: 기준선 위로 마감하면 매수.
+        단계(safe -> near -> cross)가 바뀔 때만 알리고, 안전한 쪽으로 돌아갈 때는 0.5% 여유를 둬
+        기준선 근처에서 흔들릴 때 알림이 반복되지 않게 한다. 새 봉이 확정되면 단계를 초기화한다.
+        """
+        th = self.strategy.intraday_threshold(signal_df)
+        if not th or price <= 0:
+            return
+        if signal_candle != self._warn_candle:
+            self._warn_candle, self._warn_level = signal_candle, "safe"
+        holding = self.risk_manager.state.current_positions > 0
+        # d > 0: 현재 신호가 유지되는 쪽으로의 여유 (보유면 기준선 위 거리, 미보유면 기준선 아래 거리)
+        d = (price / th - 1) if holding else (1 - price / th)
+        level = "cross" if d <= 0 else "near" if d <= self.warn_pct else "safe"
+        order = {"safe": 0, "near": 1, "cross": 2}
+        if level == self._warn_level:
+            return
+        if order[level] < order[self._warn_level]:          # 안전한 쪽으로 복귀: 여유 0.5% 필요
+            boundary = 0.0 if self._warn_level == "cross" else self.warn_pct
+            if d < boundary + 0.005:
+                return
+        self._warn_level = level
+        gap = (price / th - 1) * 100
+        side = "매도" if holding else "매수"
+        if level == "cross":
+            head = (f"🔴 장중 경고: 현재가가 {side} 기준선 {'아래' if holding else '위'}"
+                    f"\n이대로 마감하면 다음 봉 확정 직후(09:00) {side} 신호")
+        elif level == "near":
+            head = f"⚠️ 장중 경고: {side} 기준선까지 {abs(gap):.2f}%"
+        else:
+            head = f"✅ 장중: {side} 기준선에서 다시 멀어짐"
+        self._notify(f"{head}\n현재가 {price:,.0f} / 기준선 {th:,.0f} ({gap:+.2f}%)")
 
     def _notify_signal_change(self, prev: str, signal: str, signal_df: pd.DataFrame,
                               signal_candle: str, price: float) -> None:
