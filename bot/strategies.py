@@ -89,6 +89,14 @@ class BaseStrategy(ABC):
         """텔레그램 /status 에 덧붙일 전략 상태 한 줄 (없으면 빈 문자열)."""
         return ""
 
+    def intraday_threshold(self, df: pd.DataFrame) -> float | None:
+        """
+        진행 중인 봉의 종가가 이 가격을 넘으면 매수 신호, 아래면 매도 신호가 되는 경계 가격.
+        장중 경고 알림에 쓴다. 경계를 계산할 수 없는 전략은 None.
+        df: 확정봉만 (진행 중인 봉 제외)
+        """
+        return None
+
     def generate_signals_series(self, df: pd.DataFrame) -> pd.Series:
         """
         전체 데이터에 대해 각 시점의 신호를 생성합니다. (백테스트용)
@@ -870,6 +878,12 @@ class SmaTrendStrategy(BaseStrategy):
 
     def generate_signal(self, df: pd.DataFrame) -> str:
         return self.generate_signals_series(df).iloc[-1]
+
+    def intraday_threshold(self, df: pd.DataFrame) -> float | None:
+        # 오늘 종가 c 가 SMA_n(최근 n-1개 확정 종가 + c) 위  <=>  c > 최근 n-1개 종가 평균
+        if len(df) < self.period - 1:
+            return None
+        return float(df["close"].tail(self.period - 1).mean())
 
     def status_text(self, df: pd.DataFrame) -> str:
         sma = df["close"].rolling(self.period).mean().iloc[-1]

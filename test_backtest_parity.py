@@ -346,6 +346,36 @@ def check_signal_change_alert() -> None:
     assert "현재 추세 신호: 상승" in alerts[0] and "추세 전환: 상승(매수) → 하락(매도)" in alerts[1], alerts
 
 
+def check_intraday_warning() -> None:
+    """장중 경고: 기준선 3% 이내 -> 경고, 아래 -> 매도 예고, 0.5% 여유 없이는 복귀 알림 없음, 새 봉이면 초기화."""
+    import bot.trader as tr_mod
+    from bot.strategies import SmaTrendStrategy
+    closes = [100.0] * 49                       # 기준선 = 최근 49개 평균 = 100
+    sdf = pd.DataFrame({"close": closes})
+    t = Trader(strategy=SmaTrendStrategy(50), client=FakeClient(make_candles(5)),
+               market="KRW-TEST", candle_unit=1)
+    t.risk_manager.state.current_positions = 1  # 보유 중
+    sent, orig = [], tr_mod.notifier.notify
+    tr_mod.notifier.notify = sent.append
+    try:
+        for price in (110, 102.5, 102.0, 99.5, 100.3, 100.6, 104.0):
+            t._check_intraday_warning(sdf, "D1", price)
+        # 110 safe(무알림) / 102.5 near / 102.0 near(무) / 99.5 cross / 100.3 여유 부족(무) / 100.6 near / 104.0 safe
+        assert [("기준선까지" in m, "아래" in m and "🔴" in m, "멀어짐" in m) for m in sent] == [
+            (True, False, False), (False, True, False), (True, False, False), (False, False, True)], sent
+        sent.clear()
+        t._check_intraday_warning(sdf, "D1", 99.0)  # 같은 봉에서 다시 이탈 -> 알림
+        t._check_intraday_warning(sdf, "D2", 99.0)  # 새 봉 -> 초기화 후 다시 알림 (하루 1번 상기)
+        assert len(sent) == 2, sent
+        sent.clear()
+        t.risk_manager.state.current_positions = 0  # 미보유: 반대 방향 (위로 올라오면 매수 예고)
+        t._check_intraday_warning(sdf, "D3", 98.0)
+        t._check_intraday_warning(sdf, "D3", 100.5)
+        assert "매수 기준선까지" in sent[0] and "매수 기준선 위" in sent[1], sent
+    finally:
+        tr_mod.notifier.notify = orig
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
@@ -357,6 +387,7 @@ def main() -> None:
     check_no_entry_on_startup_candle()
     check_vwap_paper()
     check_signal_change_alert()
+    check_intraday_warning()
     df = make_candles()
     failures = []
 
