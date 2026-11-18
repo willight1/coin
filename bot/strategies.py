@@ -20,14 +20,14 @@ AI 자율 전략은 별도 모듈(`ai_strategy.py`)로 제공됩니다.
     # signal: "BUY", "SELL", "HOLD"
 """
 
+import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 
 import pandas as pd
 import numpy as np
 
 from .indicators import (
-    calc_rsi, calc_sma, calc_ema, calc_macd,
+    calc_rsi, calc_sma, calc_ema,
     calc_bollinger_bands, calc_volume_sma,
     is_high_breakout, calc_atr,
 )
@@ -956,3 +956,318 @@ def get_strategy_by_name(name: str) -> BaseStrategy | None:
         if strategy.name == name:
             return strategy
     return None
+
+
+# ============================================================
+# BTC 자율 에이전트 전략 라이브러리 (docs/BTC_DAYTRADE.md 2장)
+# 실행기(dt_live)·점수판·백테스트(simulate_library)가 같은 entry_exit/bar_action 을 쓴다.
+# ============================================================
+class LibraryStrategy(BaseStrategy):
+    """
+    에이전트가 고르는 전략. 파라미터는 RANGES 범위로 잘린다.
+    kind="bar": 봉 마감 때 entry_exit 마지막 값으로 판단, 다음 봉 시가(=마감 직후 시장가) 체결.
+    kind="intraday": 장중 가격이 기준가를 통과하면 체결 (vb_daily, vwap_revert).
+    """
+
+    ID = ""
+    UNIT = 60                      # 판단 봉(분). 1440 = 일봉
+    KIND = "bar"
+    RANGES: dict = {}              # 이름 -> (최소, 최대, 기본)
+    RULE = ""
+    HAS_MAX_HOLD = True            # sma_trend_daily 만 False
+
+    def __init__(self, **params):
+        self.params, self.clamped = clamp_params(self.RANGES, params)
+
+    @property
+    def name(self) -> str:
+        return self.ID
+
+    @property
+    def description(self) -> str:
+        return self.RULE
+
+    @property
+    def max_hold_h(self) -> float | None:
+        return self.params.get("max_hold") if self.HAS_MAX_HOLD else None
+
+    def entry_exit(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        """확정봉 df -> (진입 신호, 청산 신호) bool 시리즈."""
+        raise NotImplementedError
+
+    def holds(self, df: pd.DataFrame) -> bool:
+        """보유 중 전략을 이것으로 바꿀 때 포지션을 넘겨받을 상태인가 (청산 조건이 아님)."""
+        return False
+
+    def generate_signals_series(self, df: pd.DataFrame) -> pd.Series:
+        e, x = self.entry_exit(df)
+        s = pd.Series(HOLD, index=df.index)
+        s[x] = SELL
+        s[e] = BUY
+        return s
+
+    def generate_signal(self, df: pd.DataFrame) -> str:
+        return self.generate_signals_series(df).iloc[-1]
+
+
+def clamp_params(ranges: dict, params: dict | None) -> tuple[dict, list[str]]:
+    """범위 밖·모르는 값은 잘라내고 무엇을 잘랐는지 돌려준다. 숫자가 아니면 기본값."""
+    out, notes = {}, []
+    params = params or {}
+    for k, (lo, hi, default) in ranges.items():
+        v = params.get(k, default)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            notes.append(f"{k}={params.get(k)!r}→기본 {default}")
+            v = default
+        c = min(max(v, lo), hi)
+        if c != v:
+            notes.append(f"{k}={v:g}→{c:g}")
+        out[k] = int(c) if isinstance(default, int) else c
+    notes += [f"{k} 무시" for k in params if k not in ranges]
+    return out, notes
+
+
+class RsiMomoStrategy(LibraryStrategy):
+    RULE = "RSI(14)가 entry 를 상향 돌파하면 매수, RSI < exit 또는 max_hold(시간) 넘으면 매도"
+
+    def entry_exit(self, df):
+        rsi = calc_rsi(df["close"], 14)
+        e = (rsi.shift(1) < self.params["entry"]) & (rsi >= self.params["entry"])
+        return e.fillna(False), (rsi < self.params["exit"]).fillna(False)
+
+    def holds(self, df):
+        rsi = calc_rsi(df["close"], 14).iloc[-1]
+        return bool(rsi >= self.params["exit"])
+
+
+class RsiMomo1h(RsiMomoStrategy):
+    ID, UNIT = "rsi_momo_1h", 60
+    RANGES = {"entry": (65, 75, 70), "exit": (40, 55, 50), "max_hold": (24, 96, 48)}
+
+
+class RsiMomo4h(RsiMomoStrategy):
+    ID, UNIT = "rsi_momo_4h", 240
+    RANGES = {"entry": (65, 75, 70), "exit": (40, 55, 50), "max_hold": (48, 96, 96)}
+
+
+class BreakoutVol1h(LibraryStrategy):
+    ID, UNIT = "breakout_vol_1h", 60
+    RANGES = {"N": (12, 48, 24), "vol_mult": (1.5, 3.0, 2.0), "M": (6, 24, 12), "max_hold": (24, 96, 48)}
+    RULE = "종가 > 직전 N봉 고가 최댓값 + 거래대금 > 직전 N봉 평균 × vol_mult 이면 매수, 종가 < 직전 M봉 저가 최솟값 또는 max_hold 면 매도"
+
+    def entry_exit(self, df):
+        n, m = self.params["N"], self.params["M"]
+        val = df["value"] if "value" in df else df["close"] * df["volume"]
+        e = (df["close"] > df["high"].rolling(n).max().shift(1)) & \
+            (val > val.rolling(n).mean().shift(1) * self.params["vol_mult"])
+        x = df["close"] < df["low"].rolling(m).min().shift(1)
+        return e.fillna(False), x.fillna(False)
+
+    def holds(self, df):
+        return not bool(self.entry_exit(df)[1].iloc[-1])
+
+
+class SmaTrendDaily(LibraryStrategy):
+    ID, UNIT, HAS_MAX_HOLD = "sma_trend_daily", DAY_CANDLE_UNIT, False
+    RANGES = {"period": (20, 50, 50)}
+    RULE = "일봉 종가 > SMA(period) 면 다음 09:00 매수, 아래면 다음 09:00 매도. 최대 보유시간·손절 없음(킬 드로다운만)"
+
+    def entry_exit(self, df):
+        sma = df["close"].rolling(self.params["period"]).mean()
+        return (df["close"] > sma).fillna(False), (df["close"] < sma).fillna(False)
+
+    def holds(self, df):
+        return bool(self.entry_exit(df)[0].iloc[-1])
+
+
+class VbDaily(LibraryStrategy):
+    ID, UNIT, KIND = "vb_daily", DAY_CANDLE_UNIT, "intraday"
+    RANGES = {"k": (0.4, 0.7, 0.5), "ma_n": (3, 10, 5)}
+    RULE = "09:00 시가 + k × 전일 변동폭을 장중 돌파하면 매수 (시가 > 직전 ma_n일 종가 평균일 때만), 다음 날 09:00 매도"
+
+    def level(self, daily: pd.DataFrame) -> float | None:
+        """daily: 오늘(진행 중) 봉을 마지막 행으로 포함. 오늘 매수 기준가, 필터에 걸리면 None."""
+        if len(daily) < self.params["ma_n"] + 2:
+            return None
+        today, prev = daily.iloc[-1], daily.iloc[-2]
+        ma = daily["close"].iloc[-1 - self.params["ma_n"]:-1].mean()
+        if today["open"] <= ma:
+            return None
+        return float(today["open"] + self.params["k"] * (prev["high"] - prev["low"]))
+
+    def entry_exit(self, df):  # 점수판용 근사: 그날 고가가 기준가를 넘었는가
+        rng = (df["high"] - df["low"]).shift(1)
+        lvl = df["open"] + self.params["k"] * rng
+        ok = df["open"] > df["close"].rolling(self.params["ma_n"]).mean().shift(1)
+        return (ok & (df["high"] >= lvl)).fillna(False), pd.Series(True, index=df.index)
+
+
+class VwapRevert(LibraryStrategy):
+    ID, UNIT, KIND = "vwap_revert", 15, "intraday"
+    RANGES = {"dev": (0.5, 2.0, 1.0)}
+    RULE = "세션(09:00) VWAP × (1 − dev%) 에 post_only 지정가 매수, VWAP 에 지정가 매도, 09:00 강제 청산. 세션 첫 15분 거래 안 함"
+
+    def entry_exit(self, df):
+        f = pd.Series(False, index=df.index)
+        return f, f
+
+
+class Discretionary(LibraryStrategy):
+    ID, KIND = "discretionary", "manual"
+    RANGES = {"max_hold": (1, 96, 96)}
+    RULE = "에이전트가 근거를 적고 buy_now 로 직접 매수. 예산의 DT_DISCRETIONARY_MAX_PCT 이하. 청산은 sell_now·손절·max_hold"
+
+    def entry_exit(self, df):
+        f = pd.Series(False, index=df.index)
+        return f, f
+
+
+LIBRARY: dict[str, type[LibraryStrategy]] = {
+    c.ID: c for c in (RsiMomo1h, RsiMomo4h, BreakoutVol1h, SmaTrendDaily, VbDaily, VwapRevert, Discretionary)
+}
+
+
+def make_library_strategy(sid: str, params: dict | None = None) -> LibraryStrategy | None:
+    cls = LIBRARY.get(sid)
+    return cls(**(params or {})) if cls else None
+
+
+def bar_action(holding: bool, entry: bool, exit_: bool, held_h: float,
+               max_hold_h: float | None) -> str | None:
+    """봉 마감 시 판단. 실행기와 점수판이 같이 쓴다."""
+    if not holding:
+        return BUY if entry else None
+    if exit_ or (max_hold_h is not None and held_h >= max_hold_h):
+        return SELL
+    return None
+
+
+def simulate_library(strat: LibraryStrategy, df: pd.DataFrame, cost: float = 0.001) -> dict:
+    """
+    주문 없는 계산. df: 확정봉(시간 오름차순, candle_date_time_kst 포함).
+    bar: 신호봉 다음 봉 시가 체결. vb_daily: 기준가(시가가 넘으면 시가) 매수 → 다음 봉 시가 매도.
+    vwap_revert: 15분봉 근사 (직전 봉까지 VWAP 으로 지정가, 저가가 통과하면 체결, 지정가 비용 0.05%).
+    Returns: {"equity": Series(봉 시가 기준), "trades": [(진입시각, 청산시각, 수익률)]}
+    """
+    ts = pd.to_datetime(df["candle_date_time_kst"]).reset_index(drop=True)
+    o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    n = len(df)
+    eq = np.ones(n)
+    trades = []
+    cash, pos, entry_px, entry_t = 1.0, 0.0, 0.0, None
+
+    if strat.ID == "vwap_revert":
+        maker = 0.0005
+        dev = strat.params["dev"] / 100
+        sess = (ts - pd.Timedelta(hours=9)).dt.date
+        tp = (df["high"] + df["low"] + df["close"]).to_numpy(float) / 3
+        vol = df["volume"].to_numpy(float)
+        pv = v = 0.0
+        for i in range(n):
+            if i and sess[i] != sess[i - 1]:
+                if pos:
+                    cash = pos * o[i] * (1 - cost); trades.append((entry_t, ts[i], cash / entry_px - 1)); pos = 0.0
+                pv = v = 0.0
+            vwap = pv / v if v > 0 else None
+            first = i == 0 or sess[i] != sess[i - 1]
+            if vwap and not first:
+                if not pos and l[i] < vwap * (1 - dev):
+                    px = min(o[i], vwap * (1 - dev))
+                    entry_px, entry_t = cash, ts[i]
+                    pos = cash * (1 - maker) / px; cash = 0.0
+                if pos and h[i] > vwap and ts[i] != entry_t:
+                    cash = pos * max(o[i], vwap) * (1 - maker)
+                    trades.append((entry_t, ts[i], cash / entry_px - 1)); pos = 0.0
+            pv += tp[i] * vol[i]; v += vol[i]
+            eq[i] = cash + pos * c[i]
+        return {"equity": pd.Series(eq, index=ts), "trades": trades}
+
+    if strat.ID == "vb_daily":
+        e, _ = strat.entry_exit(df)
+        rng = np.r_[np.nan, (h - l)[:-1]]
+        for i in range(n):
+            if e.iloc[i] and i + 1 < n:
+                px = max(o[i], o[i] + strat.params["k"] * rng[i])
+                r = (o[i + 1] * (1 - cost)) / (px * (1 + cost)) - 1
+                cash *= 1 + r
+                trades.append((ts[i], ts[i + 1], r))
+            eq[i] = cash
+        return {"equity": pd.Series(eq, index=ts), "trades": trades}
+
+    e, x = strat.entry_exit(df)
+    e, x = e.to_numpy(bool), x.to_numpy(bool)
+    for i in range(n):
+        # i 봉 시가에 직전 봉(i-1) 신호 체결
+        if i:
+            held = (ts[i] - entry_t).total_seconds() / 3600 if pos else 0.0
+            act = bar_action(pos > 0, e[i - 1], x[i - 1], held, strat.max_hold_h)
+            if act == BUY:
+                entry_px, entry_t = cash, ts[i]
+                pos = cash * (1 - cost) / o[i]; cash = 0.0
+            elif act == SELL:
+                cash = pos * o[i] * (1 - cost)
+                trades.append((entry_t, ts[i], cash / entry_px - 1)); pos = 0.0
+        eq[i] = cash + pos * c[i]
+    return {"equity": pd.Series(eq, index=ts), "trades": trades}
+
+
+def window_stats(sim: dict, since: pd.Timestamp) -> dict:
+    """sim 의 since 이후 성과: 수익%, 거래 수(청산 기준), 승률%, MDD%."""
+    eq = sim["equity"][sim["equity"].index >= since]
+    if eq.empty:
+        return {"ret": 0.0, "trades": 0, "win": None, "mdd": 0.0}
+    base = sim["equity"][sim["equity"].index < since]
+    start = base.iloc[-1] if len(base) else eq.iloc[0]
+    tr = [t for t in sim["trades"] if t[1] >= since]
+    mdd = float(((eq / eq.cummax()) - 1).min() * 100)
+    return {"ret": round(float(eq.iloc[-1] / start - 1) * 100, 2), "trades": len(tr),
+            "win": round(100 * sum(t[2] > 0 for t in tr) / len(tr), 1) if tr else None,
+            "mdd": round(mdd, 2)}
+
+
+# 사람에게 보여 줄 한글 이름 (텔레그램·대시보드). 코드·LLM 입력은 영문 ID 를 그대로 쓴다
+KO_NAME = {
+    "rsi_momo_1h": "상승세 올라타기(1시간)", "rsi_momo_4h": "상승세 올라타기(4시간)",
+    "breakout_vol_1h": "거래 몰릴 때 최고가 돌파(1시간)", "sma_trend_daily": "평균선 위면 들고 있기(하루)",
+    "vb_daily": "아침에 크게 오르면 사기(하루)", "vwap_revert": "평균보다 쌀 때 사기(15분)",
+    "discretionary": "AI 직접 판단", "none": "현금 대기", "keep": "전략 유지", "hold": "그냥 들고 있기",
+}
+KO_PARAM = {"entry": "살 때 힘 기준", "exit": "팔 때 힘 기준", "max_hold": "최대 보유 시간", "N": "최고가 볼 기간(봉)",
+            "vol_mult": "거래량 몇 배", "M": "최저가 볼 기간(봉)", "period": "평균 낼 일수", "k": "전날 출렁임 몇 배",
+            "ma_n": "평균 낼 일수", "dev": "평균보다 몇 % 쌀 때"}
+# AI 가 쓴 문장 속 어려운 말 → 쉬운 말 (dashboard-web/lib/ko.ts 의 EASY_WORDS 와 같게)
+EASY_WORDS = [
+    (r"\bMACD(\s?hist)?\b", "오르내림 힘"), (r"\bdonchian\d*_pos\b", "최근 범위 속 위치(0=바닥, 1=꼭대기)"),
+    (r"(호가\s?)?\btop\d+\s?imbalance\b", "사자·팔자 주문 차이"), (r"\bimbalance\b", "주문 차이"),
+    (r"(체결\s?)?\bbuy_ratio\b", "사는 쪽 비율"), (r"과매도", "너무 많이 떨어진"), (r"과매수", "너무 많이 오른"),
+    (r"현물\s?롱\s?전용", "오를 때만 돈을 버는 방식"), (r"세션\s?VWAP", "오늘 평균 거래가"), (r"세션\s?", "오늘 "),
+    (r"\+DI|\bpdi\b", "상승 힘"), (r"-DI|\bmdi\b", "하락 힘"), (r"\bADX\b", "추세 세기"), (r"\bRSI\b", "과열 지수"),
+    (r"\b[ES]MA\b", "평균선"), (r"\bATR\b", "평소 출렁임폭"), (r"\bVWAP\b", "오늘 평균 거래가"),
+    (r"z\s?점수|z-?score", "평소보다 튄 정도"), (r"밴드폭\s?백분위", "출렁임 크기 순위"), (r"볼린저\s?밴드?", "가격 범위 띠"),
+    (r"역배열", "내림 순서"), (r"정배열", "오름 순서"), (r"휩쏘", "속임 신호"), (r"모멘텀", "오르는 힘"),
+    (r"음봉", "내린 봉"), (r"양봉", "오른 봉"), (r"지지선", "버티던 가격"), (r"저항선", "막히던 가격"),
+    (r"레짐|국면", "시장 흐름"), (r"플랜", "전략"), (r"\bescalate\b", "다시 판단"), (r"\bkeep\b", "유지"),
+    (r"\bconfidence\b", "확신도"), (r"\bbuy_now\b", "바로 매수"), (r"\bsell_now\b", "바로 매도"),
+    (r"\bfollow_plan\b", "전략대로"), (r"\b1d\b", "하루봉"), (r"(?-i:\b(\d+)h\b)", r"\1시간봉"), (r"(?-i:\b(\d+)m\b)", r"\1분봉"),
+]
+_EASY_RE = [(re.compile(a, re.I), b) for a, b in EASY_WORDS]
+
+
+def ko(sid: str | None) -> str:
+    return KO_NAME.get(sid or "", sid or "-")
+
+
+def ko_params(params: dict | None) -> str:
+    return ", ".join(f"{KO_PARAM.get(k, k)} {v:g}" for k, v in (params or {}).items()) or "기본값"
+
+
+def ko_sub(text: str) -> str:
+    """문장 속 전략 ID·지표 이름을 쉬운 말로 (AI 가 쓴 이유를 사람에게 보여 줄 때)."""
+    for sid in sorted(KO_NAME, key=len, reverse=True):
+        if len(sid) > 4:
+            text = text.replace(sid, KO_NAME[sid])
+    for rx, word in _EASY_RE:
+        text = rx.sub(word, text)
+    return text

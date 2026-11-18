@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 
 
-from bot.config import UPBIT_CFG, BOT_CFG, BT_CFG, RISK_CFG
+from bot.config import UPBIT_CFG, BOT_CFG, DEFAULT_TRADE_STRATEGY
 from bot.logger import get_logger
 from bot.upbit_client import UpbitClient, load_market_data
 from bot import notifier
@@ -39,8 +39,6 @@ logger = get_logger(__name__)
 # 백테스트/검증에 사용할 캔들 수 (봉 단위는 BOT_CANDLE_UNIT, 기본 1440=일봉)
 BACKTEST_CANDLES = 20_000
 
-# --strategy 없이 trade 모드를 실행할 때 쓰는 전략
-DEFAULT_TRADE_STRATEGY = "일봉 SMA50 추세"
 
 
 # ============================================================
@@ -279,6 +277,41 @@ def run_vwap_paper() -> None:
     vwap_paper.run(markets, budget, entry_pct)
 
 
+def run_btc_agent(market: str) -> None:
+    """AI 자율 매매 (docs/BTC_DAYTRADE.md). 프로세스 하나 = 코인 하나. DT_LIVE_CONFIRM=yes 일 때만 실제 주문.
+    비트코인은 state/·logs/ 에, 다른 코인은 state/dt_<코인>/·logs/dt_<코인>/ 에 따로 기록한다."""
+    os.environ["DT_MARKET"] = market.upper()     # dt_snapshot 이 import 할 때 읽는다
+    from bot.config import load_dt_config
+    from bot.dt_live import DtBot
+    from bot import dt_snapshot as snap
+    from bot.paths import PROJECT_ROOT
+    cfg = load_dt_config()
+    dirs = {} if snap.COIN == "BTC" else {"state_dir": os.path.join(PROJECT_ROOT, "state", f"dt_{snap.COIN}"),
+                                         "log_dir": os.path.join(PROJECT_ROOT, "logs", f"dt_{snap.COIN}")}
+    if cfg.live:
+        logger.warning(f"DT_LIVE_CONFIRM=yes — {snap.MARKET} AI 매매 실거래 (예산 {cfg.budget_krw:,.0f}원)")
+    else:
+        logger.info("DT_LIVE_CONFIRM 없음 — 주문 API 를 부르지 않고 호가로 가상 체결합니다")
+    notifier.install_error_alerts()
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    DtBot(cfg, UpbitClient(dry_run=not cfg.live), **dirs).run()
+
+
+def run_hl_agent() -> None:
+    """하이퍼리퀴드 롱·숏 추세 봇 (bot/hl_live.py). HL_LIVE_CONFIRM=yes + HL_PRIVATE_KEY 있을 때만 실제 주문."""
+    from bot.config import load_hl_config
+    from bot.hl_client import HlClient
+    from bot.hl_live import HlBot
+    cfg = load_hl_config()
+    if cfg.live:
+        logger.warning(f"HL_LIVE_CONFIRM=yes — 하이퍼리퀴드 실거래 ({', '.join(cfg.coins)}, 목표변동성 {cfg.target_vol:.0%}, 상한 {cfg.max_lev:g}배)")
+    else:
+        logger.info("HL_LIVE_CONFIRM 없음 — 주문 없이 중간가로 가상 체결합니다")
+    notifier.install_error_alerts()
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    HlBot(cfg, HlClient(cfg.private_key if cfg.live else "", cfg.wallet)).run()
+
+
 def run_review(date_str: str = "") -> None:
     """
     실행 로그를 분석하여 일일 수익률/전략 리뷰를 생성합니다.
@@ -313,19 +346,28 @@ def main():
   python main.py --mode review                # 오늘 로그 리뷰
   python main.py --mode review --date 2026-03-25
   BOT_LOG_PREFIX=vwap python main.py --mode vwap-paper   # VWAP 회귀 가상거래 (실제 주문 없음)
+  BOT_LOG_PREFIX=dt DT_BUDGET_KRW=300000 python main.py --mode btc-agent  # BTC 자율 에이전트 (DT_LIVE_CONFIRM=yes 면 실거래)
+  BOT_LOG_PREFIX=dt_eth DT_BUDGET_KRW=200000 python main.py --mode btc-agent --market KRW-ETH  # 코인 하나 더
+  BOT_LOG_PREFIX=hl python main.py --mode hl-agent   # 하이퍼리퀴드 BTC·ETH 롱·숏 추세 (HL_LIVE_CONFIRM=yes 면 실거래)
+  BOT_LOG_PREFIX=hl_paper HL_BUDGET_USD=781 python main.py --mode hl-paper   # 위 봇의 연습용 쌍둥이 (항상 가상 체결, state/hl_paper_live.json)
         """,
     )
 
     parser.add_argument(
         "--mode", "-m",
         required=True,
-        choices=["backtest", "validate", "trade", "review", "vwap-paper"],
+        choices=["backtest", "validate", "trade", "review", "vwap-paper", "btc-agent", "hl-agent", "hl-paper", "hl-ai"],
         help="실행 모드 (backtest / validate / trade / review)",
     )
     parser.add_argument(
         "--strategy", "-s",
         default="",
         help="실거래에 사용할 전략 이름 (trade 모드에서 사용)",
+    )
+    parser.add_argument(
+        "--market",
+        default=os.getenv("DT_MARKET", "KRW-BTC"),
+        help="btc-agent 가 매매할 코인 (예: KRW-ETH). 코인마다 프로세스를 따로 띄운다",
     )
     parser.add_argument(
         "--date",
@@ -353,6 +395,16 @@ def main():
         run_review(args.date)
     elif args.mode == "vwap-paper":
         run_vwap_paper()
+    elif args.mode == "btc-agent":
+        run_btc_agent(args.market)
+    elif args.mode == "hl-agent":
+        run_hl_agent()
+    elif args.mode == "hl-ai":                                 # AI 연습 계좌: 15분마다 AI 가 노출을 정해 가상 돈으로 매매. 파일은 hl_aipaper_*
+        os.environ["HL_INSTANCE"] = "aipaper"
+        run_hl_agent()
+    elif args.mode == "hl-paper":                              # 연습용 쌍둥이: 같은 투표를 가상 돈으로, 대기 없이. 파일은 hl_paper_*
+        os.environ["HL_INSTANCE"] = "paper"                     # bot.hl_live·load_hl_config 를 부르기 전에
+        run_hl_agent()
     else:
         parser.print_help()
 

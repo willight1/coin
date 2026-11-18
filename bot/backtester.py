@@ -28,7 +28,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from .config import BT_CFG, RISK_CFG
+from .config import BT_CFG
 from .indicators import calc_atr
 from .logger import get_logger
 from .paths import PROJECT_ROOT

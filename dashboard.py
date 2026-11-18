@@ -5,128 +5,40 @@ dashboard.py — 트레이딩 로그 시각화 대시보드
 from __future__ import annotations
 
 import json
-import os
 import re
-import signal
 import subprocess
-import sys
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from bot.config import BOT_CFG
+from bot import notifier
+from bot.config import BOT_CFG, DEFAULT_TRADE_STRATEGY, UPBIT_CFG
 from bot.paths import PROJECT_ROOT
-from bot.strategies import get_all_strategies
+from bot.strategies import get_strategy_by_name
 from bot.upbit_client import UpbitClient
 
 LOG_DIR = Path("logs")
-RUNNER_STATE_PATH = LOG_DIR / "trader_runner_state.json"
-RUNNER_STDOUT_LOG = LOG_DIR / "trader_runner.log"
 
 
 def list_log_files() -> list[Path]:
     return sorted(LOG_DIR.glob("trade_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _is_pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
+def bot_running() -> bool:
+    return subprocess.run(["pgrep", "-f", "main.py --mode trade"],
+                          capture_output=True).returncode == 0
+
+
+def manual_hold(market: str) -> str:
+    """봇의 수동 주문 정지 상태 (bot/trader.py _set_manual_hold 가 쓰는 파일). 없으면 ""."""
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def get_runner_state() -> dict:
-    if not RUNNER_STATE_PATH.exists():
-        return {"running": False}
-    try:
-        state = json.loads(RUNNER_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"running": False}
-
-    pid = int(state.get("pid", 0) or 0)
-    state["running"] = _is_pid_running(pid)
-    if not state["running"]:
-        return {"running": False}
-    return state
-
-
-def start_trade_runner(strategy_name: str, dry_run: bool) -> tuple[bool, str]:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    if not dry_run:
-        return False, "대시보드 자동매매 시작은 현재 DRY_RUN만 지원합니다. (LIVE는 터미널 실행 권장)"
-    existing = get_runner_state()
-    if existing.get("running"):
-        return False, f"이미 실행 중입니다. PID={existing.get('pid')}"
-
-    cmd = [
-        sys.executable,
-        "main.py",
-        "--mode",
-        "trade",
-        "--strategy",
-        strategy_name,
-    ]
-    env = os.environ.copy()
-    env["BOT_DRY_RUN"] = "true" if dry_run else "false"
-
-    with RUNNER_STDOUT_LOG.open("a", encoding="utf-8") as out:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            env=env,
-            stdout=out,
-            stderr=out,
-            start_new_session=True,
-        )
-
-    state = {
-        "pid": proc.pid,
-        "strategy": strategy_name,
-        "dry_run": dry_run,
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-        "cmd": " ".join(cmd),
-    }
-    RUNNER_STATE_PATH.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return True, f"자동매매 시작: PID={proc.pid}, 전략={strategy_name}, DRY_RUN={dry_run}"
-
-
-def stop_trade_runner() -> tuple[bool, str]:
-    state = get_runner_state()
-    if not state.get("running"):
-        return False, "실행 중인 자동매매 프로세스가 없습니다."
-
-    pid = int(state.get("pid", 0))
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except Exception:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception as e:
-            return False, f"중지 실패: {e}"
-
-    RUNNER_STATE_PATH.write_text(
-        json.dumps(
-            {
-                "running": False,
-                "stopped_at": datetime.now().isoformat(timespec="seconds"),
-                "last_pid": pid,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    return True, f"자동매매 중지 요청 완료: PID={pid}"
+        return json.loads((Path(PROJECT_ROOT) / "state" / f"manual_hold_{market}.json")
+                          .read_text(encoding="utf-8")).get("signal", "")
+    except (OSError, ValueError):
+        return ""
 
 
 def parse_log(log_path: Path) -> dict:
@@ -540,81 +452,59 @@ def render_dashboard(log_path: Path, data: dict | None = None) -> None:
         st.write("주문 로그 없음")
 
 
-def render_controls(default_market: str) -> None:
-    st.sidebar.header("자동매매 제어")
-    strategies = [s.name for s in get_all_strategies()]
-    default_strategy = (
-        "일봉 생존형 추세·눌림" if "일봉 생존형 추세·눌림" in strategies else strategies[0]
-    )
-    strategy_name = st.sidebar.selectbox(
-        "실행 전략",
-        options=strategies,
-        index=strategies.index(default_strategy),
-    )
-    run_dry = st.sidebar.checkbox("자동매매 DRY_RUN", value=True)
-
-    runner_state = get_runner_state()
-    if runner_state.get("running"):
-        st.sidebar.success(
-            f"실행 중: PID={runner_state.get('pid')} / {runner_state.get('strategy')}"
-        )
+def render_controls() -> None:
+    """주문은 대시보드가 직접 내지 않고 봇에 넘긴다 (텔레그램 /buy·/sell 과 같은 경로).
+    직접 내면 봇이 10초 뒤 신호대로 되돌려 버리고, 수동 주문 후 정지도 안 걸린다."""
+    market = UPBIT_CFG.market
+    st.sidebar.header(f"봇 주문 ({market})")
+    if bot_running():
+        st.sidebar.success("봇 실행 중")
     else:
-        st.sidebar.info("자동매매 정지 상태")
-
-    c1, c2 = st.sidebar.columns(2)
-    if c1.button("자동매매 시작", use_container_width=True):
-        ok, msg = start_trade_runner(strategy_name, dry_run=run_dry)
-        if ok:
-            st.sidebar.success(msg)
-        else:
-            st.sidebar.error(msg)
-        st.rerun()
-
-    if c2.button("자동매매 중지", use_container_width=True):
-        ok, msg = stop_trade_runner()
-        if ok:
-            st.sidebar.success(msg)
-        else:
-            st.sidebar.warning(msg)
-        st.rerun()
-
-    st.sidebar.divider()
-    st.sidebar.header("수동 주문")
-    manual_dry = st.sidebar.checkbox("수동주문 DRY_RUN", value=True)
-    manual_market = st.sidebar.text_input("수동주문 마켓", value=default_market)
-    buy_amount = st.sidebar.number_input(
-        "매수 금액 (KRW)",
-        min_value=5000.0,
-        value=10000.0,
-        step=1000.0,
-    )
-    sell_ratio = st.sidebar.slider("매도 비율(%)", min_value=1, max_value=100, value=100)
-
+        st.sidebar.error("봇이 꺼져 있습니다 — 주문이 전달되지 않습니다")
+    hold = manual_hold(market)
+    if hold:
+        st.sidebar.warning(f"자동매매 정지 중 — 신호가 {hold}에서 바뀌면 재개")
+    st.sidebar.caption("현재가 시장가 (매수: 현금 전액, 매도: 전량). 주문 후에는 신호가 바뀔 때까지 "
+                       "자동매매가 멈춥니다. 결과는 텔레그램과 아래 주문 로그에 남습니다.")
+    armed = st.sidebar.checkbox("주문 잠금 해제")
     b1, b2 = st.sidebar.columns(2)
-    if b1.button("수동 매수", use_container_width=True):
-        try:
-            client = UpbitClient(dry_run=manual_dry)
-            res = client.order_market_buy(market=manual_market, price=float(buy_amount))
-            st.sidebar.success(f"매수 주문 성공: {res}")
-        except Exception as e:
-            st.sidebar.error(f"매수 주문 실패: {e}")
+    if b1.button("매수", disabled=not armed, use_container_width=True):
+        notifier.send_command("/buy", "/yes")
+        st.sidebar.info("봇에 매수 전달 — 10초 안에 처리됩니다")
+    if b2.button("매도", disabled=not armed, use_container_width=True):
+        notifier.send_command("/sell", "/yes")
+        st.sidebar.info("봇에 매도 전달 — 10초 안에 처리됩니다")
+    if st.sidebar.button("자동매매 재개", disabled=not hold, use_container_width=True):
+        notifier.send_command("/auto")
+        st.sidebar.info("봇에 재개 전달")
+    st.sidebar.divider()
 
-    if b2.button("수동 매도", use_container_width=True):
-        try:
-            client = UpbitClient(dry_run=manual_dry)
-            currency = manual_market.split("-")[1] if "-" in manual_market else ""
-            if not currency:
-                st.sidebar.error("마켓 형식이 올바르지 않습니다. 예: KRW-BTC")
-            else:
-                total_volume = client.get_balance(currency)
-                sell_volume = total_volume * (sell_ratio / 100.0)
-                if sell_volume <= 0:
-                    st.sidebar.warning("매도할 잔고가 없습니다.")
-                else:
-                    res = client.order_market_sell(market=manual_market, volume=sell_volume)
-                    st.sidebar.success(f"매도 주문 성공: {res}")
-        except Exception as e:
-            st.sidebar.error(f"매도 주문 실패: {e}")
+
+def render_signal_panel(market: str) -> None:
+    """봇과 같은 전략·같은 확정봉 기준 신호 (봇은 진행 중인 봉을 빼고 판단한다)."""
+    strategy = get_strategy_by_name(DEFAULT_TRADE_STRATEGY)
+    try:
+        df = load_candles(market=market, unit=BOT_CFG.candle_unit, count=200)
+    except Exception as e:
+        st.warning(f"신호 계산용 캔들 조회 실패: {e}")
+        return
+    if strategy is None or len(df) < 2:
+        return
+    closed = df.iloc[:-1]
+    signal = strategy.generate_signal(closed)
+    price = float(df["close"].iloc[-1])
+    th = strategy.intraday_threshold(closed)
+    st.subheader(f"봇 신호 — {strategy.name}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("현재가", f"{price:,.0f}")
+    c2.metric("확정 신호", {"BUY": "매수(보유)", "SELL": "매도(현금)"}.get(signal, signal),
+              f"확정봉 {closed['timestamp'].iloc[-1]:%m-%d}", delta_color="off")
+    if th:
+        c3.metric("오늘 종가 기준선", f"{th:,.0f}", f"{(price / th - 1) * 100:+.2f}%")
+    extra = strategy.status_text(closed)
+    if extra:
+        st.caption(extra)
+    st.divider()
 
 
 def main() -> None:
@@ -635,7 +525,7 @@ def main() -> None:
         if BOT_CFG.candle_unit in unit_options else 0,
     )
     count = st.sidebar.slider("조회 캔들 수", min_value=50, max_value=500, value=200, step=10)
-    render_controls(default_market=market)
+    render_controls()
     if st.sidebar.button("차트 새로고침"):
         st.cache_data.clear()
         st.rerun()
@@ -646,6 +536,7 @@ def main() -> None:
 
     def render_all() -> None:
         data = parse_log(log_path)
+        render_signal_panel(market)
         render_account_panel(data)
         st.subheader("실시간 캔들 차트")
         render_realtime_chart(data, market=market, unit=unit, count=count)

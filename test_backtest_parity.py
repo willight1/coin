@@ -190,7 +190,10 @@ def check_telegram_commands() -> None:
     updates = [
         {"update_id": 5, "message": {"chat": {"id": 111}, "text": "/status@juno_coin_bot"}},
         {"update_id": 6, "message": {"chat": {"id": 999}, "text": "/status"}},  # 남의 chat
-        {"update_id": 7, "message": {"chat": {"id": 111}, "text": "hello"}},    # 명령 아님
+        {"update_id": 7, "message": {"chat": {"id": 111}, "text": "hello  there"}},    # 그냥 쓴 말 → 하이퍼리퀴드 데스크 대화
+        {"update_id": 8, "message": {"chat": {"id": 111}, "text": "/HL_short BTC 100"}},   # /hl_* 는 인자까지
+        {"update_id": 9, "message": {"chat": {"id": 111}, "text": "/status 인자"}},         # 그 밖의 명령은 인자를 버린다
+        {"update_id": 10, "message": {"chat": {"id": 111}, "text": "/hlp_short eth 10x"}},  # 연습용 봇
     ]
 
     class Resp:
@@ -208,8 +211,15 @@ def check_telegram_commands() -> None:
         notifier._update_offset = 0
         notifier.requests.get = lambda url, params, timeout: Resp(
             [u for u in updates if u["update_id"] >= params["offset"]])
-        assert notifier.poll_commands() == ["/status"]
+        import tempfile
+        orig_inbox = notifier.COMMAND_INBOX
+        notifier.COMMAND_INBOX = os.path.join(tempfile.mkdtemp(), "commands.txt")
+        assert notifier.poll_commands() == ["/status", "/hl_ask hello there", "/hl_short BTC 100", "/status", "/hlp_short eth 10x"]
         assert notifier.poll_commands() == []          # offset 이 넘어가서 재처리 없음
+        notifier.send_command("/buy", "/yes")          # 대시보드 -> 봇
+        assert notifier.poll_commands() == ["/buy", "/yes"]
+        assert notifier.poll_commands() == []          # 한 번만 처리
+        notifier.COMMAND_INBOX = orig_inbox
 
         notifier.notify = lambda text: sent.append(text) or True
         strategy = get_all_strategies()[-1]            # 일봉 SMA 추세 (status_text 있음)
@@ -220,7 +230,7 @@ def check_telegram_commands() -> None:
         t.client.cursor = 79
         t._tick()
         t.handle_command("/status")
-        t.handle_command("/sell")                     # 주문 명령은 없다 -> 안내만
+        t.handle_command("/xyz")                      # 모르는 명령 -> 안내만
     finally:
         notifier.requests.get, notifier.notify = orig_get, orig_notify
         for k, v in saved.items():
@@ -228,7 +238,7 @@ def check_telegram_commands() -> None:
 
     status = [m for m in sent if "] 상태 —" in m]
     assert status and "현재가" in status[0] and "SMA50" in status[0], sent
-    assert any("모르는 명령: /sell" in m for m in sent), sent
+    assert any("모르는 명령: /xyz" in m for m in sent), sent
 
 
 def check_market_summary() -> None:
@@ -376,6 +386,78 @@ def check_intraday_warning() -> None:
         tr_mod.notifier.notify = orig
 
 
+def check_manual_order() -> None:
+    """텔레그램 수동 주문: /yes 로 확정해야 체결, 체결 후 신호가 바뀔 때까지 봇이 되돌리지 않는다."""
+    import bot.trader as tr_mod
+    from bot.strategies import SmaTrendStrategy
+    up = [50_000_000 * (1.002 ** i) for i in range(80)]
+    down = [up[-1] * (0.99 ** i) for i in range(1, 40)]
+    rows = [{"open": p, "high": p, "low": p, "close": p, "volume": 1.0,
+             "candle_date_time_kst": f"2026-02-{1 + i // 24:02d}T{i % 24:02d}:00:00"}
+            for i, p in enumerate(up + down)]
+    t = Trader(strategy=SmaTrendStrategy(50), client=FakeClient(pd.DataFrame(rows)),
+               market="KRW-TEST", candle_unit=1)
+    t.state_path = None
+    t.virtual_krw_balance = 1_000_000
+    sent, orig = [], tr_mod.notifier.notify
+    tr_mod.notifier.notify = sent.append
+
+    def tick(i):
+        t.client.cursor = i
+        t._tick()
+    try:
+        tick(60); tick(61)
+        assert t.virtual_coin_balance > 0                  # 상승 추세 -> 자동 매수
+        t.handle_command("/sell")
+        assert t.virtual_coin_balance > 0, "/yes 전에는 주문하지 않는다"
+        t.handle_command("/yes")
+        assert t.virtual_coin_balance == 0
+        for i in range(62, 75):
+            tick(i)
+        assert t.virtual_coin_balance == 0, "BUY 신호가 이어지는 동안 다시 사면 안 된다"
+        i = 75
+        while t.last_notified_signal != "SELL":
+            tick(i); i += 1
+        assert t._manual_hold == ""                        # 신호 전환 -> 자동 재개
+        t.handle_command("/buy"); t.handle_command("/yes")
+        assert t.virtual_coin_balance > 0 and t._manual_hold == "SELL"
+        tick(i); tick(i + 1)
+        assert t.virtual_coin_balance > 0, "SELL 신호가 이어져도 수동 매수를 팔면 안 된다"
+        t.handle_command("/auto")
+        tick(i + 2)
+        assert t.virtual_coin_balance == 0                 # 재개 -> 추세매도
+        t._pending_manual = ("buy", 0)                      # 60초 지난 확인은 무시
+        t.handle_command("/yes")
+        assert t.virtual_coin_balance == 0
+    finally:
+        tr_mod.notifier.notify = orig
+
+
+def check_hl_snapshot() -> None:
+    import hl_snapshot as hs
+
+    def row(addr, av, pnl, vlm_month=1e6, vlm_all=1e8):
+        perf = [[k, {"pnl": str(pnl), "vlm": str(vlm_month if k == "month" else vlm_all)}]
+                for k in ("day", "week", "month", "allTime")]
+        return {"ethAddress": addr, "accountValue": str(av), "windowPerformances": perf}
+
+    ws = hs.select([row("a", 2e5, 2e6), row("b", 2e5, -5e5), row("small", 5e4, 2e6),
+                    row("mm", 2e5, 2e6, vlm_month=3e7)])
+    assert [w["addr"] for w in ws] == ["a", "b"]       # 손실 지갑도 저장, 소액·마켓메이커는 제외
+    ws[0]["btc_ntl"], ws[1]["btc_ntl"] = -300.0, 100.0
+    s = hs.summarize(ws)
+    assert s["smart_btc"] == 1 and s["smart_short_usd"] == 300 and s["smart_net_share"] == -1.0
+    import tempfile
+    from bot.market_report import hl_snapshot_text
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+        f.write("date,smart_btc,smart_long_cnt,smart_long_usd,smart_short_usd,smart_net_share\n"
+                "2026-11-03,3,1,1000000,3000000,-0.5\n")
+    t = hl_snapshot_text(f.name)
+    os.unlink(f.name)
+    assert "롱 1 / 숏 2" in t and "순비중 -0.50" in t and "1일 누적" in t, t
+    assert hl_snapshot_text("/없는/경로.csv") == ""
+
+
 def main() -> None:
     check_rules()
     check_dry_run_state()
@@ -388,6 +470,8 @@ def main() -> None:
     check_vwap_paper()
     check_signal_change_alert()
     check_intraday_warning()
+    check_manual_order()
+    check_hl_snapshot()
     df = make_candles()
     failures = []
 

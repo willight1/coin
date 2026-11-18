@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+/* 인스타그램식: 카드 20px, 버튼·칩은 완전 둥근 모양, 강조색은 파랑 하나, 그라데이션은 링에만 */
+:root {
+  --bg: #fafafa;
+  --card: #ffffff;
+  --line: #ececec;
+  --ink: #1c1c1e;
+  --sub: #737378;
+  --chip: #f2f2f4;
+  --accent: #0095f6;
+  --accent-soft: #e6f4fe;
+  --good: #0e9f6e;
+  --bad: #e5484d;
+  --warn: #b45309;
+  --warn-soft: #fff4e5;
+  --up: #e8365d;
+  --down: #3b82f6;
+  --shadow: 0 1px 2px rgb(17 17 26 / 0.04), 0 8px 24px rgb(17 17 26 / 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c0c0e;
+    --card: #161619;
+    --line: #2a2a2e;
+    --ink: #f2f2f4;
+    --sub: #a1a1a8;
+    --chip: #232327;
+    --accent: #3aa7ff;
+    --accent-soft: #0d2a40;
+    --good: #34d399;
+    --bad: #f87171;
+    --warn: #fbbf24;
+    --warn-soft: #3a2306;
+    --shadow: none;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-card: var(--card);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-sub: var(--sub);
+  --color-chip: var(--chip);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-good: var(--good);
+  --color-bad: var(--bad);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --font-sans: var(--font-pretendard), -apple-system, "Apple SD Gothic Neo", sans-serif;
+  --shadow-card: var(--shadow);
+  --radius-card: 20px;
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  -webkit-font-smoothing: antialiased;
+}
+
+.ring-ig {
+  background: conic-gradient(from 210deg, #feda75, #fa7e1e, #d62976, #962fbf, #4f5bd5, #feda75);
+}
+
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .press { transition: transform 0.12s ease; }
+  .press:active { transform: scale(0.97); }
+  .fade-in { animation: fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}

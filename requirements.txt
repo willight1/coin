@@ -5,3 +5,5 @@ python-dotenv>=1.0.0
 PyJWT>=2.8.0
 streamlit>=1.35.0
 plotly>=5.22.0
+anthropic>=2.7
+hyperliquid-python-sdk==0.24.0

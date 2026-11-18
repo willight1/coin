@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>BOT_LOG_PREFIX</key>
+		<string>dt</string>
+		<key>PATH</key>
+		<string>/Users/juno/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.juno.dtagent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/caffeinate</string>
+		<string>-i</string>
+		<string>/Users/juno/orca/coin/venv/bin/python</string>
+		<string>main.py</string>
+		<string>--mode</string>
+		<string>btc-agent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/juno/orca/coin/logs/dt_console.out</string>
+	<key>StandardOutPath</key>
+	<string>/Users/juno/orca/coin/logs/dt_console.out</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/juno/orca/coin</string>
+</dict>
+</plist>

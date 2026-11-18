@@ -22,7 +22,6 @@ validator.py — 전략 검증 모듈
 from dataclasses import dataclass, field
 
 import pandas as pd
-import numpy as np
 
 from .backtester import Backtester, BacktestResult
 from .strategies import BaseStrategy

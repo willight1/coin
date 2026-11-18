@@ -5,9 +5,15 @@ market_report.py — 텔레그램 /market 시장 상태 요약 (규칙 기반, A
 단기 방향을 맞히지 못했다 (CLAUDE.md '측정된 사실').
 """
 
+import csv
+import os
+
 import pandas as pd
 
 from .indicators import calc_atr
+from .paths import PROJECT_ROOT
+
+HL_SUMMARY = os.path.join(PROJECT_ROOT, "state", "hl_snapshots", "summary.csv")
 
 
 def _pct(a: float, b: float) -> float:
@@ -68,3 +74,22 @@ def market_summary(df: pd.DataFrame, strategy=None) -> str:
 
     lines.append("※ 과거 데이터 요약이며 예측이 아닙니다")
     return "\n".join(lines)
+
+
+def hl_snapshot_text(path: str = HL_SUMMARY) -> str:
+    """hl_snapshot.py 가 매일 쌓는 하이퍼리퀴드 고수 BTC 포지션 요약의 마지막 줄. 없으면 빈 문자열."""
+    try:
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        return ""
+    if not rows:
+        return ""
+    r = rows[-1]
+    long_, short = float(r["smart_long_usd"]), float(r["smart_short_usd"])
+    share = f"{float(r['smart_net_share']):+.2f}" if r["smart_net_share"] else "-"
+    n, nl = int(r["smart_btc"]), int(r["smart_long_cnt"])
+    return (f"하이퍼리퀴드 고수 BTC ({r['date']}, {len(rows)}일 누적)\n"
+            f"  {n}곳: 롱 {nl} / 숏 {n - nl}\n"
+            f"  롱 ${long_ / 1e6:,.1f}M / 숏 ${short / 1e6:,.1f}M, 순비중 {share}\n"
+            f"  ※ 과거 측정상 추세를 따라갈 뿐 예측력은 없었습니다")

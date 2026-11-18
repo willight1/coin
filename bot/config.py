@@ -22,8 +22,8 @@ load_dotenv()
 @dataclass(frozen=True)
 class UpbitConfig:
     """업비트 API 접속에 필요한 설정"""
-    access_key: str = ""
-    secret_key: str = ""
+    access_key: str = field(default="", repr=False)      # repr=False: 오류 메시지·로그에 설정이 찍혀도 키는 안 나오게
+    secret_key: str = field(default="", repr=False)
     market: str = "KRW-BTC"            # 거래 대상 마켓
     markets: tuple[str, ...] = ("KRW-BTC",)  # 거래 대상 마켓 목록
     base_url: str = "https://api.upbit.com"
@@ -37,6 +37,9 @@ class UpbitConfig:
 # 업비트가 지원하는 분봉 단위. 1440 은 일봉(/v1/candles/days) — 분 단위로 두면
 # 봉 길이 계산(unit * 60초)이 모든 경로에서 그대로 맞는다.
 DAY_CANDLE_UNIT = 1440
+
+# --strategy 없이 trade 모드를 실행할 때 쓰는 전략 (대시보드 신호 표시도 이것)
+DEFAULT_TRADE_STRATEGY = "일봉 SMA50 추세"
 SUPPORTED_CANDLE_UNITS = (1, 3, 5, 10, 15, 30, 60, 240, DAY_CANDLE_UNIT)
 
 
@@ -80,6 +83,119 @@ class RiskConfig:
     atr_block_mult: float = 2.8         # ATR 초고변동 차단 배수
     high_vol_buy_scale: float = 0.5     # 고변동 구간 매수금액 축소 비율
 
+
+# ============================================================
+# BTC 자율 에이전트 (--mode btc-agent, docs/BTC_DAYTRADE.md 7장). 에이전트(LLM)가 바꿀 수 없는 한도.
+# ============================================================
+@dataclass(frozen=True)
+class DtConfig:
+    budget_krw: float = 0.0             # 필수. 원화 잔고가 더 많아도 이 값까지만 쓴다
+    live: bool = False                  # DT_LIVE_CONFIRM=yes 일 때만 실제 주문
+    # LLM 경로 (docs/BTC_DAYTRADE_LLM_CACHE.md): 1 = Max 구독 claude -p, 2 = ANTHROPIC_API_KEY + 캐싱
+    llm_primary: str = "claude_cli"     # claude_cli | api
+    llm_fallback: str = "api"           # 반대쪽 경로로 넘어가기 | none
+    quick_model: str = "claude-haiku-5-5"   # 빠른 점검 (keep / escalate)
+    deep_model: str = "claude-sonnet-5-5"   # 깊은 판단 (4장 형식). 경로 1·2 모두 이 두 값을 쓴다
+    cli_workdir: str = os.path.expanduser("~/orca/dt_llm_empty")
+    cli_timeout_sec: int = 120
+    fallback_hold_min: float = 60.0
+    check_hot_min: float = 1.0          # 신호 임박·발생 후 30분
+    check_holding_min: float = 2.0      # 보유 중
+    check_idle_min: float = 5.0         # 현금이고 조용함
+    max_quick_calls_per_day: int = 800
+    max_deep_calls_per_day: int = 120   # 넘으면 현재 플랜만 실행 (보유 중 urgent_sell 은 예외)
+    api_daily_budget_usd: float = 3.0   # 경로 2 하루 비용. 넘으면 빠른 점검 간격 2배
+    api_total_budget_usd: float = 0.0   # 경로 2 누적 비용 상한. 다 쓰면 구독으로 (0 = 상한 없음)
+    api_reset_day: int = 0              # 매달 이 날(1~28) 0시에 누적 비용을 0 으로 (월간 크레딧 충전일). 0 = 안 지움
+    max_buys_per_day: int = 6           # 0 = 제한 없음 (청산 후 쿨다운은 그대로)
+    daily_loss_pct: float = 3.0
+    weekly_loss_pct: float = 8.0
+    kill_drawdown_pct: float = 15.0
+    stop_min_pct: float = 1.5
+    stop_max_pct: float = 5.0
+    max_hold_hours: float = 96.0
+    cooldown_min: float = 30.0
+    max_spread_bp: float = 5.0
+    min_confidence: float = 0.6
+    discretionary_max_pct: float = 30.0
+    min_plan_hold_min: float = 60.0
+    wake_move_pct: float = 1.0
+    # 50일선 봇과 같은 계좌를 쓰므로, 봇 기록 없는 BTC 를 넘겨받으면 50일선 봇 물량을 가져간다. 기본 끔
+    adopt_account_btc: bool = False
+
+
+def load_dt_config() -> "DtConfig":
+    g = os.getenv
+    return DtConfig(
+        budget_krw=_float_env("DT_BUDGET_KRW", 0.0),
+        live=g("DT_LIVE_CONFIRM", "").strip().lower() == "yes",
+        llm_primary=g("DT_LLM_PRIMARY", "claude_cli").strip() or "claude_cli",
+        llm_fallback=g("DT_LLM_FALLBACK", "api").strip() or "api",
+        quick_model=g("DT_QUICK_MODEL", "claude-haiku-5-5").strip() or "claude-haiku-5-5",
+        deep_model=g("DT_DEEP_MODEL", "claude-sonnet-5-5").strip() or "claude-sonnet-5-5",
+        cli_workdir=os.path.expanduser(g("DT_CLI_WORKDIR", "~/orca/dt_llm_empty").strip() or "~/orca/dt_llm_empty"),
+        cli_timeout_sec=_int_env("DT_CLI_TIMEOUT_SEC", 120),
+        fallback_hold_min=_float_env("DT_FALLBACK_HOLD_MIN", 60.0),
+        check_hot_min=_float_env("DT_CHECK_HOT_MIN", 1.0),
+        check_holding_min=_float_env("DT_CHECK_HOLDING_MIN", 2.0),
+        check_idle_min=_float_env("DT_CHECK_IDLE_MIN", 5.0),
+        max_quick_calls_per_day=_int_env("DT_MAX_QUICK_CALLS_PER_DAY", 800),
+        max_deep_calls_per_day=_int_env("DT_MAX_DEEP_CALLS_PER_DAY", 120),
+        api_daily_budget_usd=_float_env("DT_API_DAILY_BUDGET_USD", 3.0),
+        api_total_budget_usd=_float_env("DT_API_TOTAL_BUDGET_USD", 0.0),
+        api_reset_day=int(_float_env("DT_API_RESET_DAY", 0)),
+        max_buys_per_day=_int_env("DT_MAX_BUYS_PER_DAY", 6),
+        daily_loss_pct=_float_env("DT_DAILY_LOSS_PCT", 3.0),
+        weekly_loss_pct=_float_env("DT_WEEKLY_LOSS_PCT", 8.0),
+        kill_drawdown_pct=_float_env("DT_KILL_DRAWDOWN_PCT", 15.0),
+        stop_min_pct=_float_env("DT_STOP_MIN_PCT", 1.5),
+        stop_max_pct=_float_env("DT_STOP_MAX_PCT", 5.0),
+        max_hold_hours=_float_env("DT_MAX_HOLD_HOURS", 96.0),
+        cooldown_min=_float_env("DT_COOLDOWN_MIN", 30.0),
+        max_spread_bp=_float_env("DT_MAX_SPREAD_BP", 5.0),
+        min_confidence=_float_env("DT_MIN_CONFIDENCE", 0.6),
+        discretionary_max_pct=_float_env("DT_DISCRETIONARY_MAX_PCT", 30.0),
+        min_plan_hold_min=_float_env("DT_MIN_PLAN_HOLD_MIN", 60.0),
+        wake_move_pct=_float_env("DT_WAKE_MOVE_PCT", 1.0),
+        adopt_account_btc=_bool_env("DT_ADOPT_ACCOUNT_BTC", False),
+    )
+
+
+
+@dataclass
+class HlConfig:
+    """하이퍼리퀴드 추세 봇(--mode hl-agent). 신호·근거는 bot/hl_signals.py 와 strategy-research 스킬."""
+    budget_usd: float = 1000.0          # 가상 모드 시작 자산(USD). 실거래는 계좌 평가금액을 쓴다
+    coins: tuple[str, ...] = ("BTC", "ETH")   # 자산을 코인 수로 똑같이 나눠 각각 독립 운용
+    target_vol: float = 0.60            # 목표 연변동성. 배수 = 이 값 ÷ 최근 20일 실현변동성
+    max_lev: float = 3.0                # 배수 상한 (측정상 3→10 으로 올려도 결과 같음). 거래소 상한(BTC 40·ETH 25)을 넘으면 거기서 잘림
+    min_lev: float = 0.0                # 배수 하한. 0 = 없음. 2 로 두면 MDD 47% → 89% (strategy-research)
+    kill_drawdown_pct: float = 60.0     # 시작 자산 대비 평가금액 하락 → 전량 청산 후 정지. 0 = 끔
+    maker_wait_sec: float = 300.0       # 지정가 우선: 재조정 주문을 지정가로 걸고 이 시간(초) 뒤 남은 건 시장가. 0 = 바로 시장가 (maker_fill.py: 5분이면 90% 체결)
+    maker_only: bool = False            # True 면 지정가로 못 채운 '늘리는' 수량을 시장가로 잇지 않는다(줄이는 수량은 시장가). HL_MAKER_ONLY (환경 기본 1)
+    ai_shadow: bool = True              # AI 운용역 그림자 기록(bot/hl_ai.py). 매매에는 안 쓴다. HL_AI_SHADOW=0 으로 끔
+    private_key: str = field(default="", repr=False)   # HL_PRIVATE_KEY. 있어야 실거래 (API 지갑 키 권장: 출금 불가)
+    wallet: str = ""                    # HL_WALLET_ADDRESS. API 지갑을 쓰면 본 지갑 주소
+    live: bool = False                  # HL_LIVE_CONFIRM=yes + 키 있을 때만 실제 주문
+
+
+def load_hl_config() -> "HlConfig":
+    g = os.getenv
+    key = g("HL_PRIVATE_KEY", "").strip()
+    twin = bool(g("HL_INSTANCE", "").strip())                 # 연습용 쌍둥이(--mode hl-paper): 실주문·AI 그림자 없음
+    return HlConfig(
+        budget_usd=_float_env("HL_BUDGET_USD", 1000.0),
+        coins=tuple(c.strip().upper() for c in g("HL_COINS", "BTC,ETH").split(",") if c.strip()),
+        target_vol=_float_env("HL_TARGET_VOL", 0.60),
+        max_lev=_float_env("HL_MAX_LEV", 3.0),
+        min_lev=_float_env("HL_MIN_LEV", 0.0),
+        kill_drawdown_pct=_float_env("HL_KILL_DRAWDOWN_PCT", 60.0),
+        maker_wait_sec=_float_env("HL_MAKER_WAIT_SEC", 300.0),
+        maker_only=g("HL_MAKER_ONLY", "1").strip() != "0",
+        ai_shadow=g("HL_AI_SHADOW", "1").strip() != "0" and not twin,
+        private_key=key, wallet=g("HL_WALLET_ADDRESS", "").strip(),
+        live=bool(key) and g("HL_LIVE_CONFIRM", "").strip().lower() == "yes" and not twin,
+    )
 
 # ============================================================
 # 환경변수에서 설정 로드

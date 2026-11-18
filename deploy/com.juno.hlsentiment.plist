@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.juno.hlsentiment</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/juno/orca/coin/venv/bin/python</string>
+		<string>research/hl_sentiment.py</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/juno/orca/coin</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Minute</key>
+		<integer>5</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/juno/orca/coin/logs/hl_sentiment.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/juno/orca/coin/logs/hl_sentiment.out</string>
+</dict>
+</plist>

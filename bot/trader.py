@@ -24,7 +24,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from .config import UPBIT_CFG, BOT_CFG, RISK_CFG, BT_CFG
+from .config import UPBIT_CFG, BOT_CFG, BT_CFG
 from .logger import get_logger
 from .paths import PROJECT_ROOT
 from .upbit_client import UpbitClient, UpbitClientError, load_market_data
@@ -34,7 +34,7 @@ from .indicators import calc_atr
 from .llm_gate import LLMGate
 from . import notifier
 from .config import DAY_CANDLE_UNIT
-from .market_report import market_summary
+from .market_report import hl_snapshot_text, market_summary
 
 logger = get_logger(__name__)
 DEFAULT_DRY_RUN_KRW = 1_000_000.0
@@ -89,6 +89,10 @@ class Trader:
         self._warn_level = "safe"
         self._last_signal_df: pd.DataFrame | None = None  # /status 용 직전 확정봉 데이터
         self._started_at = datetime.now()
+        # 텔레그램 수동 주문: /buy·/sell 후 /yes 로 확정. 체결되면 그때 신호가 바뀔 때까지 자동매매를 멈춘다
+        # (안 멈추면 10초 뒤 봇이 신호대로 되돌려 버린다). 재시작해도 이어지게 파일에 둔다.
+        self._pending_manual: tuple[str, float] | None = None  # (buy|sell, 요청 시각)
+        self._manual_hold: str | None = None  # 수동 주문 시점 신호. "" = 자동, None = 아직 안 읽음
         # 봇이 켜진 시점에 이미 확정돼 있던 봉으로는 새로 매수하지 않는다.
         # 백테스트는 '확정 직후 다음 봉 시가'에만 진입하는데, 하루 중간에 켜면 그 시점이 이미 지났다.
         # (예전엔 새벽에 켜면 기준가 아래로 급락하는 도중에 매수될 수 있었다.) 매도는 막지 않는다.
@@ -249,7 +253,7 @@ class Trader:
             return
 
         try:
-            volume = self.client.get_balance(self.currency)
+            volume = self._get_coin_balance()
             if volume <= 0:
                 self.state_synced = True
                 return
@@ -262,6 +266,15 @@ class Trader:
             if avg_buy_price <= 0:
                 logger.warning(
                     f"[동기화] 기존 보유 감지({self.market})했지만 기준 가격 조회 실패"
+                )
+                self.state_synced = True
+                return
+
+            # 매도 후 남는 찌꺼기(예: 0.00000001)는 최소 주문금액 미만이라 팔 수도 없다.
+            # 포지션으로 잡으면 매분 매도 실패 → API 실패로 신규 주문이 막힌다.
+            if volume * avg_buy_price < MIN_ORDER_KRW:
+                logger.info(
+                    f"[동기화] 최소 주문금액 미만 잔량 무시: {self.market} volume={volume:.8f}"
                 )
                 self.state_synced = True
                 return
@@ -361,6 +374,15 @@ class Trader:
         elif not self.log_signal_change_only:
             logger.info(f"  전략 신호: {signal} (확정봉: {signal_candle})")
         self._check_intraday_warning(signal_df, signal_candle, current_price)
+
+        if self._manual_hold is None:
+            self._manual_hold = self._load_manual_hold()
+        if self._manual_hold:
+            if signal == self._manual_hold:
+                self._log_block(f"  자동매매 정지: 수동 주문 후 신호 전환 대기 (현재 {signal})")
+                return
+            self._set_manual_hold("")
+            self._notify(f"신호 전환 {signal} — 자동매매 재개")
 
         gate_decision = None
         effective_signal = signal
@@ -793,13 +815,100 @@ class Trader:
                 # 52주 고점·SMA200 에 1년치 일봉이 필요하다 (트레이더 캔들 창 200봉과 별개로 조회)
                 daily = load_market_data(self.client, self.market, count=400,
                                          unit=DAY_CANDLE_UNIT)
-                self._notify("시장 상태\n" + market_summary(daily, self.strategy))
+                hl = hl_snapshot_text()
+                self._notify("시장 상태\n" + market_summary(daily, self.strategy)
+                             + (f"\n\n{hl}" if hl else ""))
+            elif cmd in ("/buy", "/sell", "/yes", "/auto"):
+                self._handle_manual(cmd)
+            elif cmd.startswith("/dt_"):
+                # BTC 자율 에이전트 명령: getUpdates 는 이 봇만 읽으므로 에이전트 명령함으로 넘긴다
+                notifier.send_dt_command(cmd)
+            elif cmd.startswith("/hlp_"):
+                notifier.send_command("/hl_" + cmd[5:], path=notifier.HL_PAPER_INBOX)   # 연습용 쌍둥이 봇 (답은 [하이퍼리퀴드 연습] 으로 온다)
+            elif cmd.startswith("/hl_"):
+                notifier.send_command(cmd, path=notifier.HL_COMMAND_INBOX)     # 하이퍼리퀴드 봇이 다음 틱(30초 안)에 처리
             elif cmd in ("/help", "/start"):
                 self._notify(notifier.HELP_TEXT)
             else:
                 self._notify(f"모르는 명령: {cmd}\n\n{notifier.HELP_TEXT}")
         except Exception as e:
             logger.warning(f"텔레그램 명령 처리 실패 ({cmd}): {e}")
+            # 조용히 실패하면 '텔레그램이 죽었다'로 보인다 (예: 업비트 IP 미등록 401)
+            self._notify(f"{cmd} 처리 실패: {str(e)[:300]}")
+
+    def _manual_hold_path(self) -> str:
+        return os.path.join(os.path.dirname(self.state_path), f"manual_hold_{self.market}.json")
+
+    def _load_manual_hold(self) -> str:
+        if not self.state_path:  # 테스트: 파일을 읽지 않는다
+            return ""
+        try:
+            with open(self._manual_hold_path(), encoding="utf-8") as f:
+                return json.load(f).get("signal", "")
+        except (OSError, ValueError):
+            return ""
+
+    def _set_manual_hold(self, signal: str) -> None:
+        self._manual_hold = signal
+        if not self.state_path:
+            return
+        path = self._manual_hold_path()
+        if not signal:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"signal": signal,
+                       "at": datetime.now().isoformat(timespec="seconds")}, f)
+
+    def _handle_manual(self, cmd: str) -> None:
+        """
+        /buy, /sell: 주문 내용을 보여주고 대기. /yes: 60초 안이면 시장가 체결. /auto: 자동매매 즉시 재개.
+        ponytail: 멀티마켓이면 main.py 가 모든 트레이더에 명령을 돌려서 전 마켓에 주문된다. 마켓 인자는 그때 추가.
+        """
+        if cmd == "/auto":
+            self._pending_manual = None
+            self._set_manual_hold("")
+            self._notify("자동매매 재개")
+            return
+
+        price = float(self.client.get_ticker(self.market).get("trade_price", 0))
+        holding = self.risk_manager.state.current_positions > 0
+        if cmd in ("/buy", "/sell"):
+            if (cmd == "/buy") == holding:
+                self._notify("이미 보유 중입니다" if holding else "보유 코인이 없습니다")
+                return
+            if cmd == "/buy":
+                amount = self.risk_manager.get_buy_amount(self._get_krw_balance())
+                if amount < MIN_ORDER_KRW:
+                    self._notify(f"매수 가능 금액 부족 ({amount:,.0f}원)")
+                    return
+                what = f"{amount:,.0f}원 시장가 매수"
+            else:
+                what = f"{self._get_coin_balance():.8f} {self.currency} 전량 시장가 매도"
+            self._pending_manual = (cmd[1:], time.time())
+            self._notify(f"{self.market} 현재가 {price:,.0f}\n{what}\n"
+                         "60초 안에 /yes 를 보내면 실행합니다")
+            return
+
+        # /yes
+        pending, self._pending_manual = self._pending_manual, None
+        if not pending or time.time() - pending[1] > 60:
+            self._notify("확인할 주문이 없습니다 (/buy 또는 /sell 먼저, 60초 안에 /yes)")
+            return
+        if pending[0] == "buy" and not holding:
+            ok = self._execute_buy(
+                self.risk_manager.get_buy_amount(self._get_krw_balance()), price)
+        elif pending[0] == "sell" and holding:
+            ok = self._execute_sell(price, reason="MANUAL")
+        else:
+            self._notify("그 사이 보유 상태가 바뀌어 취소했습니다")
+            return
+        if ok:
+            self._set_manual_hold(self.last_notified_signal or HOLD)
+            self._notify(f"자동매매 정지 — 신호가 {self._manual_hold}에서 바뀌면 재개 "
+                         "(/auto 로 즉시 재개)")
 
     def _status_text(self) -> str:
         price = float(self.client.get_ticker(self.market).get("trade_price", 0))
@@ -822,6 +931,8 @@ class Trader:
         else:
             lines.append("보유 없음 (현금)")
         lines.append(f"현금 {krw:,.0f}원")
+        if self._manual_hold:
+            lines.append(f"자동매매 정지 중 (신호가 {self._manual_hold}에서 바뀌면 재개, /auto)")
         return ("\n".join(lines) + self._equity_text(krw + coin * price)
                 + f"\n가동 시작 {self._started_at:%m-%d %H:%M}")
 
@@ -921,17 +1032,38 @@ class Trader:
             logger.info(f"[계좌] {label} 스냅샷 예외: {e}")
         return None
 
+    def _dt_share(self) -> tuple[float, float]:
+        """
+        같은 계좌의 AI 매매 봇(--mode btc-agent, 코인별) 몫 (원화, 이 마켓 코인). 이 봇은 그만큼 빼고 매매한다.
+        원화: 코인 봇들은 DT_BUDGET_KRW 하나(pool_krw)를 같이 쓴다 → pool_krw − Σ pool_used.
+        예전 형식(pool_krw 없음)은 reserve_krw 를 그대로 더한다. 코인 수량은 같은 마켓 봇 몫만.
+        """
+        krw = vol = pool = used = 0.0
+        for d in notifier.dt_dirs():
+            try:
+                with open(os.path.join(d, "dt_live.json"), encoding="utf-8") as f:
+                    s = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if "pool_krw" in s:
+                pool, used = max(pool, float(s["pool_krw"] or 0)), used + float(s.get("pool_used") or 0)
+            else:
+                krw += float(s.get("reserve_krw") or 0)
+            if s.get("market", "KRW-BTC") == self.market:
+                vol += float(s.get("btc_volume") or 0)
+        return krw + max(0.0, pool - used), vol
+
     def _get_krw_balance(self) -> float:
-        """KRW 잔고 조회 (DRY_RUN이면 가상잔고 반환)."""
+        """KRW 잔고 조회 (DRY_RUN이면 가상잔고 반환). 실거래는 에이전트 몫을 뺀다."""
         if self.client.dry_run:
             return self.virtual_krw_balance
-        return self.client.get_balance("KRW")
+        return max(0.0, self.client.get_balance("KRW") - self._dt_share()[0])
 
     def _get_coin_balance(self) -> float:
-        """코인 잔고 조회 (DRY_RUN이면 가상잔고 반환)."""
+        """코인 잔고 조회 (DRY_RUN이면 가상잔고 반환). 실거래는 에이전트 몫을 뺀다."""
         if self.client.dry_run:
             return self.virtual_coin_balance
-        return self.client.get_balance(self.currency)
+        return max(0.0, self.client.get_balance(self.currency) - self._dt_share()[1])
 
     def _get_avg_buy_price(self) -> float:
         """평균 매수가 조회 (DRY_RUN이면 가상 평단 반환)."""

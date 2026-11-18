@@ -93,7 +93,7 @@ class UpbitClient:
     def _request(self, method: str, endpoint: str,
                  params: dict | None = None,
                  data: dict | None = None,
-                 auth: bool = False) -> dict | list:
+                 auth: bool = False, retry: bool = True) -> dict | list:
         """
         HTTP 요청을 보내고 응답을 반환합니다.
         재시도 로직 포함.
@@ -104,6 +104,7 @@ class UpbitClient:
             params: GET 파라미터
             data: POST 바디
             auth: 인증 필요 여부
+            retry: False 면 1회만 시도. 주문 POST 는 응답이 끊겨도 재전송하면 중복 주문이 될 수 있다
 
         Returns:
             dict 또는 list: API 응답 JSON
@@ -119,7 +120,8 @@ class UpbitClient:
             headers["Authorization"] = self._create_token(query)
 
         last_error = None
-        for attempt in range(1, self.max_retries + 1):
+        tries = self.max_retries if retry else 1
+        for attempt in range(1, tries + 1):
             try:
                 response = requests.request(
                     method=method,
@@ -131,6 +133,13 @@ class UpbitClient:
                 )
 
                 # HTTP 에러 확인 (업비트 주문 생성은 201 Created 응답 가능)
+                # 초당 조회 한도(429): 같은 IP 의 봇 여러 개(코인별 AI 봇)가 정각 봉 마감에 몰리면 난다.
+                # 오류로 올리지 않고 잠깐 쉬었다 다시 (주문 POST 는 retry=False 라 여기 안 옴)
+                if response.status_code == 429 and attempt < tries:
+                    last_error = "조회 한도 초과(429)"
+                    logger.info(f"업비트 조회 한도 초과 — {attempt}초 쉬고 다시 (시도 {attempt}/{tries})")
+                    time.sleep(attempt)
+                    continue
                 if not (200 <= response.status_code < 300):
                     error_msg = f"API 에러 [{response.status_code}]: {response.text}"
                     logger.error(error_msg)
@@ -151,7 +160,7 @@ class UpbitClient:
                 logger.warning(last_error)
 
             # 재시도 대기 (지수 백오프)
-            if attempt < self.max_retries:
+            if attempt < tries:
                 wait = 2 ** attempt
                 logger.info(f"{wait}초 후 재시도합니다...")
                 time.sleep(wait)

@@ -32,3 +32,13 @@ state/
 
 # Claude Code 로컬 설정 (사용자별, 공유하지 않음)
 .claude/settings.local.json
+
+# 연구 데이터·캐시 (스크립트로 다시 받는다: research/leverage_2026-11/fetch_bn.py, fetch_metrics.py)
+*.pkl
+research/*.jsonl
+
+# 딥리서치 메모 (보고서는 reports/)
+research_notes/
+
+# 콘솔 출력
+*.out

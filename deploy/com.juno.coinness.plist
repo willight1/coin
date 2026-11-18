@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.juno.coinness</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/juno/orca/coin/venv/bin/python</string>
+		<string>research/coinness.py</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/juno/orca/coin</string>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/juno/orca/coin/logs/coinness.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/juno/orca/coin/logs/coinness.out</string>
+</dict>
+</plist>
