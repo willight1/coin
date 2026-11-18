@@ -1,125 +1,81 @@
-# 실행 명령어 정리
+# 명령어
 
-## 0) 환경 준비
+전역 python 이 아니라 `./venv/bin/python` 을 씁니다. 설정값 설명은 `.env.example` 에 있습니다(기본값은 `bot/config.py`).
+
+## 실행
+
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+./venv/bin/python main.py --mode backtest                 # 전략별 백테스트
+./venv/bin/python main.py --mode validate                 # 인샘플/아웃오브샘플 검증
+./venv/bin/python main.py --mode trade                    # 50일선 추세 봇 (BOT_DRY_RUN=true 면 가상)
+./venv/bin/python main.py --mode review --date 2026-03-28 # 그날 로그 복기
+BOT_LOG_PREFIX=vwap ./venv/bin/python main.py --mode vwap-paper
+BOT_LOG_PREFIX=dt DT_BUDGET_KRW=300000 ./venv/bin/python main.py --mode btc-agent   # DT_LIVE_CONFIRM=yes 없으면 가상 체결
+BOT_LOG_PREFIX=hl ./venv/bin/python main.py --mode hl-agent                         # HL_LIVE_CONFIRM=yes 없으면 가상 체결
 ```
 
-## 1) 기본 실행
+## 상시 실행 (macOS launchd)
+
+`deploy/*.plist` 를 `~/Library/LaunchAgents/` 에 복사하고 `launchctl load` 합니다. 경로는 자기 환경에 맞게 고칩니다.
+launchd 가 띄운 봇은 **`nohup` 으로 따로 띄우지 않습니다**(중복 실행). 재시작은 아래 명령만 씁니다.
+
 ```bash
-./venv/bin/python main.py --mode backtest
-./venv/bin/python main.py --mode validate
-./venv/bin/python main.py --mode trade                           # 기본: 일봉 SMA50 추세
-./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"   # 미검증
-./venv/bin/python main.py --mode review
-./venv/bin/python main.py --mode review --date 2026-03-28
-./venv/bin/python -m streamlit run dashboard.py
+launchctl kickstart -k gui/$(id -u)/com.juno.coinbot    # 50일선 봇
+launchctl kickstart -k gui/$(id -u)/com.juno.hlagent    # 하이퍼리퀴드 실계좌
+launchctl kickstart -k gui/$(id -u)/com.juno.hlpaper    # 하이퍼리퀴드 연습용
+launchctl kickstart -k gui/$(id -u)/com.juno.hlai       # 하이퍼리퀴드 AI 연습 계좌
 ```
 
-## 2) 전략별 트레이드 실행
+| 서비스 | 하는 일 |
+|---|---|
+| `com.juno.dtagent` | BTC 자율 에이전트 |
+| `com.juno.hlweekly` | 매주 월요일 투표단 재선정 |
+| `com.juno.hlsentiment` | 매시 5분 시장 심리·고래 지갑 기록 |
+| `com.juno.coinness` | 10분마다 코인니스 속보 기록 |
+
+## 대시보드
+
 ```bash
-./venv/bin/python main.py --mode trade --strategy "AI 자율 매매"
-./venv/bin/python main.py --mode trade --strategy "1분 생존형 추세·눌림"
-./venv/bin/python main.py --mode trade --strategy "레짐 적응형 (추세+평균회귀)"
-./venv/bin/python main.py --mode trade --strategy "RSI 과매도/과매수"
-./venv/bin/python main.py --mode trade --strategy "이동평균 크로스"
-./venv/bin/python main.py --mode trade --strategy "RSI + 이동평균 필터"
-./venv/bin/python main.py --mode trade --strategy "볼린저밴드 평균회귀"
-./venv/bin/python main.py --mode trade --strategy "돌파 + 거래량 증가"
+cd dashboard-web && npm install && npm run build && npx next start -H 127.0.0.1 -p 3000
 ```
 
-## 3) 로그/상태 확인
+`/api/command` 가 주문 명령을 보낼 수 있으므로 **반드시 `-H 127.0.0.1`** 로 엽니다. 휴대폰에서는 Tailscale 로 봅니다(`tailscale serve --bg --http=80 http://127.0.0.1:3000`).
+예전 Streamlit 화면: `./venv/bin/python -m streamlit run dashboard.py`, `dt_dashboard.py`.
+
+## 텔레그램
+
+텔레그램 메시지는 50일선 봇만 읽고, `/dt_*`·`/hl_*`·`/hlp_*` 는 각 봇의 명령함 파일(`state/*_commands.txt`)로 넘깁니다. **50일선 봇이 꺼져 있으면 다른 봇 명령도 안 먹습니다.** 전체 목록은 봇에게 `/help`.
+
+| 봇 | 명령 |
+|---|---|
+| 50일선 봇 | `/status` `/market` `/buy` `/sell` `/auto` — 사고파는 것은 60초 안 `/yes` |
+| BTC 에이전트 | `/dt_status` `/dt_plan` `/dt_stop` `/dt_go` `/dt_flat` — 확인은 `/dt_yes` |
+| 하이퍼리퀴드 실계좌 | `/hl_status` `/hl_half` `/hl_wait` `/hl_stop` `/hl_go` `/hl_long` `/hl_short` `/hl_close` `/hl_hold` `/hl_auto` `/hl_at` `/hl_list` `/hl_cancel` `/hl_scalp` — 확인은 `/hl_yes` |
+| 하이퍼리퀴드 연습용 | 위 명령을 `/hlp_` 로 |
+
+명령 없이 말을 보내면 하이퍼리퀴드 데스크 AI 가 답합니다. 주문 부탁은 명령으로 바꿔 보여 주고 `/hl_yes` 확인을 받습니다.
+
+## 멈추기
+
 ```bash
-tail -f logs/trade_$(date +%F).log
-tail -f logs/trade_$(date +%F).log | rg "ERROR|WARNING|API 에러|no_authorization_ip"
+touch state/DT_STOP     # BTC 에이전트: 새 매수만 멈춤 (재개 /dt_go)
+touch state/HL_STOP     # 하이퍼리퀴드: 전부 정리하고 멈춤 (재개 /hl_go)
+touch state/HL_WAIT     # 전부 정리하고 새 추세까지 대기
+touch state/HL_HALF     # 절반으로 줄이고 새 추세부터 전액
 ```
 
-### API 인증 확인 (주문 없음)
+## 로그
+
 ```bash
-./venv/bin/python - <<'PY'
-from bot.upbit_client import UpbitClient, UpbitClientError
-c = UpbitClient(dry_run=True)
-try:
-    c.get_accounts()
-    print("AUTH_OK")
-except UpbitClientError as e:
-    print("AUTH_FAIL", e)
-PY
+tail -f logs/trade_$(date +%F).log   # 50일선 봇
+tail -f logs/dt_$(date +%F).log      # BTC 에이전트
+tail -f logs/hl_$(date +%F).log      # 하이퍼리퀴드
 ```
 
-### 공인 IP 확인
+## 검사
+
 ```bash
-curl -4 https://api.ipify.org
-curl -6 https://api64.ipify.org
+./venv/bin/python test_backtest_parity.py
+./venv/bin/python test_dt_agent.py
+./venv/bin/python test_hl_agent.py
 ```
-
-## 4) .env 핵심 설정
-
-### 모의/실거래
-```env
-BOT_DRY_RUN=true
-BOT_DRY_RUN=false
-```
-
-### 실행/로그
-```env
-BOT_INTERVAL_SECONDS=3
-BOT_LOG_SIGNAL_CHANGE_ONLY=false
-```
-
-### 멀티마켓
-```env
-UPBIT_MARKET=KRW-BTC
-UPBIT_MARKETS=KRW-BTC,KRW-ETH,KRW-XRP
-```
-
-### 리스크/청산
-```env
-BUY_RATIO_PCT=0.30
-MIN_KRW_RESERVE=5000
-STOP_LOSS_PCT=0.05
-TAKE_PROFIT_PCT=0.10
-TRAILING_STOP_PCT=0.05
-MIN_NET_PROFIT_PCT=0.00
-MAX_CHASE_PCT=0.003
-MAX_POSITIONS=0
-COOLDOWN_SECONDS=30
-MAX_CONSECUTIVE_BUY_SIGNALS=0
-```
-
-### GPT 리뷰(선택)
-```env
-OPENAI_API_KEY=your_key
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_TIMEOUT_SECONDS=20
-```
-
-### LLM 매수 게이트(선택)
-```env
-LLM_GATE_ENABLED=true
-LLM_GATE_MODEL=gpt-4o-mini
-LLM_GATE_TIMEOUT_SECONDS=8
-LLM_GATE_MIN_CONFIDENCE=0.55
-LLM_GATE_FAIL_OPEN=true
-LLM_GATE_MAX_INPUT_CANDLES=120
-```
-
-### AI 자율 매매(선택)
-```env
-AI_TRADER_ENABLED=true
-AI_TRADER_MODEL=gpt-4o-mini
-AI_TRADER_TIMEOUT_SECONDS=10
-AI_TRADER_MAX_INPUT_CANDLES=160
-AI_TRADER_MIN_CONFIDENCE=0.55
-AI_TRADER_FAIL_SIGNAL=HOLD
-```
-
-## 5) 권장 순서
-1. `./venv/bin/python main.py --mode backtest`
-2. `./venv/bin/python main.py --mode validate`
-3. `./venv/bin/python main.py --mode trade` (`BOT_DRY_RUN=true`, 기본 전략 일봉 SMA50 추세)
-4. 종료는 `Ctrl+C` (END 스냅샷 기록)
-5. `./venv/bin/python main.py --mode review --date $(date +%F)`

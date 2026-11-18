@@ -1,7 +1,31 @@
 # CLAUDE.md
 
+> **답변 언어 규칙 (필수):** 사용자에게 보이는 모든 글은 **한국어로만** 쓴다. 최종 답변뿐 아니라 도구 호출 사이의 짧은 진행 문장, 긴급 경고, 표, 텔레그램·대시보드 문구까지 전부. 영어 등 다른 언어로 답하지 않는다. 코드·명령어·파일 경로만 원문 그대로 둔다.
+
 업비트 현물 자동매매 봇. 구조와 전략 목록은 코드를 읽으면 되므로 여기 적지 않는다.
 아래는 **코드만 봐서는 알 수 없는 것들**이다.
+
+## 하이퍼리퀴드 롱·숏 추세 봇 (`--mode hl-agent`)
+
+`bot/hl_live.py`·`bot/hl_signals.py`·`bot/hl_client.py`. 합격한 규칙들의 투표를 분석가별로 평균한 노출(−1~+1) × 변동성 맞춤 배수로 4시간봉 마감마다 재조정한다. **기능별 상세(투표단·주문 방식·명령·예약·단타·대화창·연습 계좌·기록 파일·대시보드)는 `docs/HL_AGENT.md` 에 있다 — 이 봇 코드나 대시보드 하이퍼리퀴드 탭을 손대기 전에 반드시 먼저 읽을 것.** 여기에는 항상 지켜야 할 것만 남긴다.
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.juno.hlagent   # 실계좌. 연습용 com.juno.hlpaper, AI 연습 com.juno.hlai 도 같은 방식
+./venv/bin/python test_hl_agent.py
+```
+
+- **재시작은 `launchctl kickstart` 로만.** launchd(`deploy/*.plist`, KeepAlive)가 띄우므로 nohup 으로 따로 띄우면 중복이다. 4시간봉 마감(KST 1·5·9·13·17·21시) 직후 1분은 피하고, 지정가 주문이 걸려 있을 때(`state.pending`·미체결 주문)는 실계좌 봇을 재시작하지 않는다(분봉 단타의 손절 트리거 주문만 걸려 있으면 괜찮다). `hl_rules.py`·`hl_signals.py` 를 바꾸면 반드시 재시작한다 — 안 하면 옛 코드가 새 투표단 이름을 못 찾아 0표로 센다.
+- **합격 기준은 고정이다**(OOS>0·PF>1.2·3구간 중 2개+·30회+, BTC·ETH 모두). 느슨하게 해서 통과시키지 말 것. 투표단은 이 기준으로 자동 재선정된다(사용자 요청으로 승인 없음, 바뀌면 텔레그램).
+- **실계좌 매매 로직을 바꾸는 것은 측정 결과를 보여 주고 승인받은 뒤에만.** 사용자가 직접 지시한 운영 변경(멈춤·주문·모드)은 바로 한다.
+- **사용자가 정한 것 — 다시 말리지 말고 사실만:** 배수 하한 5배(측정상 전멸 구간), 분봉 단타 20배(측정 32개 조합 전부 탈락). 고정 배수는 쓰지 않는다 — 배수 다이얼은 `HL_TARGET_VOL`.
+- **시장가는 쓰지 않는다**(`HL_MAKER_ONLY=1`, 정리 주문 포함). 예외는 킬 드로다운 전량 청산과 분봉 단타의 거래소 손절 트리거 주문 둘뿐이다.
+- **측정에서 탈락한 것 — 다시 제안하지 말 것**(수치는 `strategy-research` 스킬): 고정 2~3배, 성적 1등 분석가·규칙 따르기와 성적 가중, 익절 후 재진입, 여러 시간대 다수결 정리, 급반등 비상선, 1분~1시간봉 규칙, 굴림 일봉·단기 추세 분석가 분리·8/12시간봉 규칙 추가, RSI 역추세(70 숏·30 롱), 코인 추가.
+- **매매 판단에 쓰지 않는 것(전부 참고용):** AI 운용역 그림자와 AI 연습 계좌(과거 재생 탈락 — 그림자 8주 성적이 규칙보다 낫고 사용자가 승인해야 옮긴다), 연습용 쌍둥이, 시장 심리·고래·코인니스 기록, 시간대별 방향판.
+- **실주문으로 아직 확인 안 된 경로**(처음엔 소액으로): 배수 지정 주문(`100 20x`) 체결, 예약 주문이 가격에 닿아 실행되는 것, 분봉 단타 실가동, 대화창 '실행' 버튼으로 나가는 주문. 확인된 것: 지정가 정리(`/hl_close`), 손절 트리거 주문 걸기·조회·취소.
+- **텔레그램 `/hl_*` 는 50일선 봇이 넘겨 준다** — 50일선 봇이 꺼져 있으면 안 먹는다. 클로드 코드 세션에서 사용자가 시킬 때는 명령함 `state/hl_commands.txt` 에 한 줄 쓰면 된다(포지션이 바뀌는 명령은 60초 안 `/hl_yes`).
+- 대시보드 카드에 숫자를 새로 넣으면 용어 설명(`HlPanel.Help`)도 같이 넣는다.
+- `test_hl_agent.py` 는 `hl_ai.shadow_async` 를 막아 둔다(안 막으면 검사가 실제 API 를 부른다).
+- 업비트 봇들과 무관한 별도 계좌(달러). 2026-11-17 부터 실계좌는 ETH 멈춤(`/hl_hold`, 되돌리기 `/hl_auto ETH`)이고 BTC 가 계좌 전액 기준으로 돈다.
 
 ## 불변 규칙: 백테스트와 실거래는 같은 코드로 판단한다
 
@@ -76,3 +100,29 @@ LLM 관련 모듈 3개의 실제 역할(코드가 이름만으로는 오해를 �
 전역 python이 아니라 **`./venv/bin/python`**을 쓴다.
 
 `dashboard.py`는 잔고·손익·차단사유·AI 로그를 이미 다 보여준다. 비어 보인다면 대시보드 문제가 아니라 **데이터가 없는 것**이다 — `.env`에 업비트 키가 있어야 잔고가 뜨고, 봇이 한 번은 돌아서 `logs/trade_*.log`가 쌓여야 손익 추이가 나온다.
+
+## BTC 자율 에이전트 운영 (`--mode btc-agent`)
+
+지시서: `docs/BTC_DAYTRADE.md`, LLM 호출: `docs/BTC_DAYTRADE_LLM_CACHE.md`. 검증 기준(OOS)을 통과한 전략이 아니다 — 예산 한도(`DT_BUDGET_KRW`) 안의 실험으로 돌린다.
+
+```bash
+BOT_LOG_PREFIX=dt DT_BUDGET_KRW=300000 ./venv/bin/python main.py --mode btc-agent   # DT_LIVE_CONFIRM=yes 없으면 가상 체결
+./venv/bin/python test_dt_agent.py                                                  # 가짜 클라이언트 테스트 (네트워크 없음)
+cd dashboard-web && npm run build && npx next start -H 127.0.0.1 -p 3000             # 실시간 대시보드 (Next.js)
+```
+
+- 대시보드는 `dashboard-web/`(Next.js 16, App Router). 봇 파일(`state/`, `logs/`)을 서버 쪽 라우트(`app/api/*`)가 직접 읽는다. **반드시 `-H 127.0.0.1` 로 연다** — `/api/command` 가 '전부 팔기'를 보낼 수 있다(JSON 본문·같은 출처만 받게 막아 두었다). 한글 전략 이름은 `dashboard-web/lib/ko.ts` 와 `bot/strategies.py` 의 `KO_NAME` 두 곳에 있다.
+- 아이폰에서 보기: Tailscale(맥·아이폰 같은 계정)로 `tailscale serve --bg --http=80 http://127.0.0.1:3000` → `http://<맥 이름>.<테일넷>.ts.net`(주소는 `tailscale serve status` 로 확인). 내 기기끼리만 열린다. 끄기는 `tailscale serve --http=80 off`. Next 서버는 여전히 127.0.0.1 로만 띄운다.
+- 예전 Streamlit 판 `dt_dashboard.py` 도 남아 있다(`./venv/bin/python -m streamlit run dt_dashboard.py`).
+
+- **코인마다 프로세스 하나** (`--market KRW-ETH`, 기본 KRW-BTC). 비트코인은 `state/`·`logs/`, 다른 코인은 `state/dt_<코인>/`·`logs/dt_<코인>/` 에 따로 쓴다. `DT_BUDGET_KRW` 는 **모든 코인 봇이 같이 쓰는 돈 하나**다(먼저 사는 코인이 쓰고 남은 돈을 다른 코인이 씀). 각 봇이 `pool_krw`·`pool_used` 를 쓰고 `DtBot.cash()` 가 다른 봇 `pool_used` 를 뺀다. 매수는 `state/dt_pool.lock` 으로 한 봇씩. **하루·7일 손실 한도와 킬 드로다운도 모든 코인 손익 합계로 본다**(`day_pnl_all` 등). 2026-11-13 부터 비트코인만 돈다(ETH·XRP·SOL 상태는 `state/off_dt_<코인>/` 로 치워 둠 — 폴더 이름을 `dt_<코인>` 으로 되돌리고 띄우면 재개). 띄우기: `BOT_LOG_PREFIX=dt_eth nohup caffeinate -i ./venv/bin/python main.py --mode btc-agent --market KRW-ETH >> logs/dt_eth_console.out 2>&1 &` (동시에 켜면 시작 시 캔들 조회가 몰리니 20초 간격). 호가 단위는 시작할 때 `/v1/orderbook/instruments` 에서 받는다. `/dt_*` 명령·대시보드 버튼·`state/DT_STOP` 은 모든 코인에 적용, API 예산 `DT_API_TOTAL_BUDGET_USD` 도 모든 코인 합산. 대시보드는 위쪽 탭으로 코인 선택.
+- 상시 실행: `deploy/com.juno.dtagent.plist` 를 `~/Library/LaunchAgents/` 에 복사 후 `launchctl load`. 예산·실거래 확인은 `.env`.
+- **50일선 봇과 같은 계좌다.** 에이전트 몫(`reserve_krw`, `btc_volume`=그 코인 수량, `market`)을 각 `dt_live.json` 에 쓰고 `trader._dt_share()` 가 원화는 모든 코인 몫 합, 코인은 같은 마켓 몫만 빼고 매매한다. **이 코드를 바꾸면 50일선 봇도 다시 띄워야 반영된다.** 가상 체결이면 몫은 0. 에이전트는 계좌 BTC 를 넘겨받지 않는다(`DT_ADOPT_ACCOUNT_BTC`).
+- **텔레그램 getUpdates 는 50일선 봇만 읽는다.** `/dt_*` 명령은 50일선 봇이 `state/dt_commands.txt` 로 넘긴다(대시보드 버튼도 이 파일). 50일선 봇이 꺼져 있으면 텔레그램 `/dt_*` 가 안 먹는다. `/dt_flat` 확인은 `/yes` 가 아니라 `/dt_yes`(50일선 봇 `/yes` 와 충돌).
+- LLM: 경로 1 = Max 구독 `claude -p`(빈 폴더 `~/orca/dt_llm_empty`, 도구·MCP·설정 끔). **subprocess 환경에서 `ANTHROPIC_API_KEY` 를 지운다** — 남아 있으면 구독 대신 API 키로 과금된다. 경로 2 = `ANTHROPIC_API_KEY` + system 두 블록 1시간 캐싱.
+- AI 답에는 기술 근거 `reason` 과 별도로 초보자용 `easy`(ELI5) 칸이 있다. 텔레그램·대시보드는 `easy` 를 먼저 보여 준다. 남은 지표 이름은 `EASY_WORDS`(`bot/strategies.py`, `dashboard-web/lib/ko.ts` 두 곳)가 쉬운 말로 바꾼다.
+- `DT_LLM_PRIMARY=api` 면 API 를 먼저 쓰고, 누적 비용(`state/dt_live.json` 의 `llm.api_total_usd`, 날이 바뀌어도 안 지움)이 `DT_API_TOTAL_BUDGET_USD` 에 닿으면 구독(`claude -p`)만 쓴다. API 오류(키 없음·크레딧 소진 등)면 60분 구독 후 재시도. `DT_API_RESET_DAY`(지금 16 = 월간 크레딧 충전일)에 모든 코인 봇이 0 으로 되돌린다. 손으로 채우려면 `api_total_usd` 를 0 으로.
+- 구독 사용률: `claude -p --output-format stream-json --verbose` 의 `rate_limit_event` 에 5시간·7일 사용률이 온다 → `state/dt_live.json` 의 `sub_limits`. 사용자 본인의 Claude Code 사용분이 같이 들어간 값이다.
+- 빠른 점검(Haiku)이 1·2·5분마다 keep/escalate 만 정하고, 깊은 판단(Sonnet)이 플랜을 정한다. LLM 호출은 워커 스레드에서 돌고 결과 적용은 메인 루프에서 한다 — 호출 중에도 손절·킬 드로다운은 10초마다 확인된다.
+- 기록: 상태 `state/dt_live.json`, 교훈 `state/dt_lessons.md`, 체결 `logs/dt_trades.csv`, 판단 `logs/dt_decisions.jsonl`(스냅샷 포함, 하루 수 MB), 평가금액 `logs/dt_equity.csv`, 복기 `logs/dt_reviews.jsonl`, 로그 `logs/dt_<날짜>.log`.
+- 정지: 신규 매수만 멈춤 = `/dt_stop` 또는 `touch state/DT_STOP`. 재개 = `/dt_go`. 전량 매도 후 정지 = `/dt_flat` → 60초 안 `/dt_yes`. 프로세스 종료(SIGTERM)는 포지션을 두고 상태만 저장한다.
